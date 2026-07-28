@@ -32,6 +32,20 @@
         <div><dt>网关</dt><dd class="mono-value">{{ item.details.gateway or '无' }}</dd></div>
         <div><dt>DNS</dt><dd class="mono-value">{{ item.details.dns|join(', ') if item.details.dns else '无' }}</dd></div>
       </dl>
+      <div class="device-actions">
+        <button
+          type="button"
+          class="button-info"
+          data-configure-wired="{{ item.device }}"
+          {% if not item.profile.configurable %}
+          disabled
+          title="{{ item.profile.configuration_error }}"
+          {% endif %}
+        >配置</button>
+      </div>
+      {% if not item.profile.configurable and item.profile.configuration_error %}
+      <p class="muted form-hint">{{ item.profile.configuration_error }}</p>
+      {% endif %}
     </article>
     {% endfor %}
   {% else %}
@@ -50,4 +64,149 @@
     </article>
   {% endif %}
 </section>
+
+<div class="modal-backdrop hidden" id="wired-modal-backdrop" aria-hidden="true">
+  <div class="modal-panel modal-panel-narrow" role="dialog" aria-modal="true" aria-labelledby="wired-modal-title">
+    <div class="modal-header">
+      <div>
+        <h3 id="wired-modal-title">配置有线网络</h3>
+        <p class="muted" id="wired-modal-subtitle"></p>
+      </div>
+      <button type="button" class="modal-close-button" id="close-wired-modal-button" aria-label="关闭">{{ icon("x", 18) }}</button>
+    </div>
+    <form action="{{ url_for('wired_apply') }}" method="post" class="login-form" data-agent-operation-form id="wired-config-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="ifname" value="">
+      <label>
+        IPv4 模式
+        <select name="ipv4_method" id="wired-ipv4-method" required>
+          <option value="auto">DHCP</option>
+          <option value="manual">静态地址</option>
+        </select>
+      </label>
+      <label id="wired-dns-mode-field">
+        DNS
+        <select name="dns_mode" id="wired-dns-mode">
+          <option value="automatic">自动获取</option>
+          <option value="manual">手动指定</option>
+        </select>
+      </label>
+      <div class="login-form hidden" id="wired-static-fields">
+        <label>
+          IP 地址
+          <input type="text" class="mono-value" name="ipv4_address" placeholder="192.168.1.20" inputmode="decimal">
+        </label>
+        <label>
+          子网掩码
+          <input type="text" class="mono-value" name="netmask" placeholder="255.255.255.0" inputmode="decimal">
+        </label>
+        <label>
+          默认网关
+          <input type="text" class="mono-value" name="gateway" placeholder="192.168.1.1" inputmode="decimal">
+          <p class="muted form-hint">不需要默认路由时可以留空</p>
+        </label>
+      </div>
+      <div class="login-form hidden" id="wired-dns-fields">
+        <label>
+          主 DNS
+          <input type="text" class="mono-value" name="primary_dns" placeholder="223.5.5.5" inputmode="decimal">
+        </label>
+        <label>
+          备用 DNS
+          <input type="text" class="mono-value" name="secondary_dns" placeholder="1.1.1.1" inputmode="decimal">
+        </label>
+      </div>
+      <p class="warning" id="wired-dhcp-required-warning" hidden>
+        Linux Router 要求至少保留一个使用 DHCP 的有线网口。如需全部使用静态地址，请通过 NetworkManager 或 nmcli 手动配置。
+      </p>
+      <p class="muted form-hint">应用配置时该网口连接可能暂时中断。</p>
+      <button type="submit">应用配置</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_scripts %}
+<script>
+  (() => {
+    const devices = {{ wired.devices|tojson }};
+    const dhcpInterfaceCount = {{ wired.dhcp_interface_count|default(0)|tojson }};
+    const modal = document.getElementById("wired-modal-backdrop");
+    const form = document.getElementById("wired-config-form");
+    const subtitle = document.getElementById("wired-modal-subtitle");
+    const methodInput = document.getElementById("wired-ipv4-method");
+    const dnsModeInput = document.getElementById("wired-dns-mode");
+    const dnsModeField = document.getElementById("wired-dns-mode-field");
+    const staticFields = document.getElementById("wired-static-fields");
+    const dnsFields = document.getElementById("wired-dns-fields");
+    const warning = document.getElementById("wired-dhcp-required-warning");
+    let selectedDevice = null;
+
+    const field = (name) => form?.querySelector(`[name="${name}"]`);
+
+    const updateFields = () => {
+      const isStatic = methodInput?.value === "manual";
+      const manualDns = isStatic || dnsModeInput?.value === "manual";
+      staticFields?.classList.toggle("hidden", !isStatic);
+      dnsModeField?.classList.toggle("hidden", isStatic);
+      dnsFields?.classList.toggle("hidden", !manualDns);
+      staticFields?.querySelectorAll("input").forEach((input) => {
+        input.disabled = !isStatic;
+        input.required = isStatic && input.name !== "gateway";
+      });
+      dnsFields?.querySelectorAll("input").forEach((input) => {
+        input.disabled = !manualDns;
+      });
+      if (dnsModeInput) dnsModeInput.disabled = isStatic;
+      if (warning) warning.hidden = true;
+    };
+
+    const closeModal = () => {
+      modal?.classList.add("hidden");
+      modal?.setAttribute("aria-hidden", "true");
+      selectedDevice = null;
+    };
+
+    document.querySelectorAll("[data-configure-wired]").forEach((button) => {
+      button.addEventListener("click", () => {
+        selectedDevice = devices.find((item) => item.device === button.dataset.configureWired) || null;
+        if (!selectedDevice || !form || !methodInput || !dnsModeInput) return;
+        const profile = selectedDevice.profile || {};
+        field("ifname").value = selectedDevice.device || "";
+        methodInput.value = profile.ipv4_method === "manual" ? "manual" : "auto";
+        dnsModeInput.value = profile.automatic_dns ? "automatic" : "manual";
+        field("ipv4_address").value = profile.ipv4_address || "";
+        field("netmask").value = profile.netmask || "255.255.255.0";
+        field("gateway").value = profile.gateway || "";
+        field("primary_dns").value = profile.dns?.[0] || "";
+        field("secondary_dns").value = profile.dns?.[1] || "";
+        subtitle.textContent = `${selectedDevice.device} · 当前${profile.ipv4_method_label || "未知"}`;
+        updateFields();
+        modal.classList.remove("hidden");
+        modal.setAttribute("aria-hidden", "false");
+        methodInput.focus();
+      });
+    });
+
+    methodInput?.addEventListener("change", updateFields);
+    dnsModeInput?.addEventListener("change", updateFields);
+    document.getElementById("close-wired-modal-button")?.addEventListener("click", closeModal);
+    modal?.addEventListener("click", (event) => {
+      if (event.target === modal) closeModal();
+    });
+    window.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !modal?.classList.contains("hidden")) closeModal();
+    });
+    form?.addEventListener("submit", (event) => {
+      if (
+        methodInput?.value === "manual"
+        && dhcpInterfaceCount - (selectedDevice?.is_dhcp ? 1 : 0) < 1
+      ) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (warning) warning.hidden = false;
+      }
+    }, { capture: true });
+  })();
+</script>
 {% endblock %}

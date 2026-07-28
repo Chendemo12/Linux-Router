@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from ipaddress import IPv4Address, IPv4Interface, IPv4Network, ip_network
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,8 +20,10 @@ from .core import (
     CommandResult,
     HOTSPOT_CONNECTION_NAME,
     command_exists,
+    get_network_interface_hardware,
     is_hotspot_virtual_interface,
     is_service_active,
+    load_network_config,
     normalize_mac_address,
     request_system_reboot,
 )
@@ -51,6 +54,7 @@ from .network_operations import (
     rescan_wifi,
     start_hotspot_profile,
     stop_hotspot_profile,
+    apply_wired_profile,
 )
 from .hotspot_keepalive import (
     clear_hotspot_keepalive,
@@ -184,6 +188,124 @@ def _require_wireless_interface(params: dict[str, Any]) -> str:
     return ifname
 
 
+def _require_wired_interface(params: dict[str, Any]) -> str:
+    ifname = _require_string(params, "ifname", maximum=15)
+    if not _IFNAME_RE.fullmatch(ifname):
+        raise ValidationError("有线接口名称无效")
+    device = get_device_status_item(ifname)
+    physical_ifnames = {
+        item.get("name", "") for item in get_network_interface_hardware()
+    }
+    if (
+        device.get("type") != "ethernet"
+        or device.get("device") != ifname
+        or ifname not in physical_ifnames
+    ):
+        raise ValidationError(f"找不到有线接口 {ifname}")
+    return ifname
+
+
+def _normalize_wired_dns(values: list[str]) -> list[str]:
+    dns: list[str] = []
+    for raw_value in values:
+        value = raw_value.strip()
+        if not value:
+            continue
+        try:
+            address = IPv4Address(value)
+        except ValueError as exc:
+            raise ValidationError(f"DNS 地址无效：{value}") from exc
+        if address.is_unspecified or address.is_multicast:
+            raise ValidationError(f"DNS 地址无效：{value}")
+        normalized = str(address)
+        if normalized not in dns:
+            dns.append(normalized)
+    if len(dns) > 2:
+        raise ValidationError("最多只能配置两个 DNS 地址")
+    return dns
+
+
+def _normalize_wired_config(params: dict[str, Any]) -> dict[str, Any]:
+    method = _require_string(params, "ipv4_method", maximum=16)
+    if method == "auto":
+        dns_mode = _require_string(params, "dns_mode", maximum=16) or "automatic"
+        if dns_mode not in {"automatic", "manual"}:
+            raise ValidationError("DNS 模式无效")
+        dns = (
+            _normalize_wired_dns(
+                [
+                    _require_string(params, "primary_dns", maximum=15),
+                    _require_string(params, "secondary_dns", maximum=15),
+                ]
+            )
+            if dns_mode == "manual"
+            else []
+        )
+        if dns_mode == "manual" and not dns:
+            raise ValidationError("手动 DNS 模式至少需要填写一个 DNS 地址")
+        return {
+            "method": "auto",
+            "address": "",
+            "gateway": "",
+            "dns": dns,
+            "automatic_dns": dns_mode == "automatic",
+        }
+    if method != "manual":
+        raise ValidationError("IPv4 模式无效")
+
+    address_raw = _require_string(params, "ipv4_address", maximum=15)
+    netmask = _require_string(params, "netmask", maximum=15)
+    gateway_raw = _require_string(params, "gateway", maximum=15)
+    try:
+        interface = IPv4Interface(f"{address_raw}/{netmask}")
+    except ValueError as exc:
+        raise ValidationError("请输入有效的静态 IPv4 地址和子网掩码") from exc
+    address = interface.ip
+    network = interface.network
+    if not 8 <= network.prefixlen <= 30:
+        raise ValidationError("子网掩码必须对应 /8 到 /30")
+    if (
+        address in {network.network_address, network.broadcast_address}
+        or address.is_unspecified
+        or address.is_loopback
+        or address.is_multicast
+        or address.is_link_local
+    ):
+        raise ValidationError("静态 IPv4 地址不能是网络地址、广播地址或保留地址")
+
+    gateway = ""
+    if gateway_raw:
+        try:
+            gateway_address = IPv4Address(gateway_raw)
+        except ValueError as exc:
+            raise ValidationError("默认网关无效") from exc
+        if gateway_address not in network or gateway_address in {
+            network.network_address,
+            network.broadcast_address,
+            address,
+        }:
+            raise ValidationError("默认网关必须是同一子网内的其他主机地址")
+        gateway = str(gateway_address)
+
+    hotspot_network = ip_network(load_network_config()["lan_network"])
+    if isinstance(hotspot_network, IPv4Network) and network.overlaps(hotspot_network):
+        raise ValidationError(f"静态地址网段不能与热点 LAN 网段 {hotspot_network} 重叠")
+
+    dns = _normalize_wired_dns(
+        [
+            _require_string(params, "primary_dns", maximum=15),
+            _require_string(params, "secondary_dns", maximum=15),
+        ]
+    )
+    return {
+        "method": "manual",
+        "address": f"{address}/{network.prefixlen}",
+        "gateway": gateway,
+        "dns": dns,
+        "automatic_dns": False,
+    }
+
+
 def _validate_context(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or len(value) > 8:
         raise ValidationError("操作上下文无效")
@@ -302,6 +424,35 @@ def _execute_wifi_forget(params: dict[str, Any]) -> dict[str, Any]:
         raise ValidationError("Wi-Fi 配置编号无效") from exc
     name = _require_string(params, "name", maximum=128) or "该网络"
     return _result(forget_wifi_profile(profile_uuid), f"已忘记 {name}", f"忘记 {name} 失败")
+
+
+def _execute_wired_apply(params: dict[str, Any]) -> dict[str, Any]:
+    ifname = _require_wired_interface(params)
+    config = _normalize_wired_config(params)
+    status = gather_wired_network_info()
+    device = next(
+        (item for item in status.get("devices", []) if item.get("device") == ifname),
+        None,
+    )
+    if not device:
+        raise ValidationError(f"找不到有线接口 {ifname}")
+    profile = device.get("profile", {})
+    if not profile.get("configurable", True):
+        raise ValidationError(profile.get("configuration_error") or "该有线配置当前不能通过面板修改")
+    if config["method"] == "manual":
+        remaining_dhcp = status.get("dhcp_interface_count", 0) - int(
+            device.get("is_dhcp", False)
+        )
+        if remaining_dhcp < 1:
+            raise ValidationError(
+                "Linux Router 要求至少保留一个使用 DHCP 的有线网口；"
+                "如需全部使用静态地址，请通过 NetworkManager 或 nmcli 手动配置"
+            )
+    return _result(
+        apply_wired_profile(ifname, config),
+        f"已更新 {ifname} 的有线配置",
+        f"更新 {ifname} 的有线配置失败",
+    )
 
 
 def _execute_hotspot_start(
@@ -470,6 +621,7 @@ def _execute_service_monitor_action(params: dict[str, Any]) -> dict[str, Any]:
 
 
 OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "wired_apply": _execute_wired_apply,
     "wifi_rescan": _execute_wifi_rescan,
     "wifi_connect": _execute_wifi_connect,
     "wifi_disconnect": _execute_wifi_disconnect,
@@ -552,7 +704,7 @@ class AgentRuntime:
             raise ValidationError("不支持的系统操作")
         if not isinstance(params, dict) or len(params) > 16:
             raise ValidationError("操作参数无效")
-        if scope not in {"network", "hotspot", "dependencies", "system", "tools"}:
+        if scope not in {"wired", "network", "hotspot", "dependencies", "system", "tools"}:
             raise ValidationError("操作范围无效")
         with self.submit_lock:
             if self.queue.full():

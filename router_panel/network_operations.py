@@ -4,7 +4,7 @@ import time
 from configparser import ConfigParser
 from io import StringIO
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .core import (
     CommandResult,
@@ -25,17 +25,164 @@ from .core import (
 from .contracts import WifiConnectResult
 from .network import (
     get_active_wifi_connection,
+    get_active_wired_connection,
     get_device_status_item,
     get_device_details,
     get_hotspot_active_connection_for_parent,
     get_hotspot_profile,
     get_wifi_connection_profiles,
+    get_wired_carrier,
+    get_wired_connection_profiles,
+    select_wired_connection_profile,
     get_wireless_interface_phy_map,
     get_wireless_phy_capabilities,
 )
 from .network_parsers import parse_csv_values, parse_nmcli_lines
 
 ProgressCallback = Callable[[str], None]
+
+
+def _wired_profile_config(profile: dict[str, Any]) -> dict[str, Any]:
+    address = str(profile.get("ipv4_address", "")).strip()
+    prefix_length = int(profile.get("prefix_length", 24))
+    return {
+        "method": str(profile.get("ipv4_method", "auto")),
+        "address": f"{address}/{prefix_length}" if address else "",
+        "gateway": str(profile.get("gateway", "")).strip(),
+        "dns": [str(item).strip() for item in profile.get("dns", []) if str(item).strip()],
+        "automatic_dns": bool(profile.get("automatic_dns", True)),
+    }
+
+
+def _modify_wired_profile(profile_uuid: str, config: dict[str, Any]) -> CommandResult:
+    method = str(config.get("method", "auto"))
+    dns = ",".join(str(item) for item in config.get("dns", []))
+    command = [
+        "nmcli",
+        "connection",
+        "modify",
+        "uuid",
+        profile_uuid,
+        "ipv4.method",
+        method,
+        "ipv4.addresses",
+        str(config.get("address", "")) if method == "manual" else "",
+        "ipv4.gateway",
+        str(config.get("gateway", "")) if method == "manual" else "",
+        "ipv4.dns",
+        dns,
+        "ipv4.ignore-auto-dns",
+        "no" if method == "auto" and config.get("automatic_dns", True) else "yes",
+    ]
+    return run_command(command, timeout=20)
+
+
+def _verify_wired_profile(ifname: str, config: dict[str, Any]) -> CommandResult:
+    expected_address = str(config.get("address", ""))
+    for _ in range(10):
+        state = get_device_status_item(ifname).get("state", "")
+        details = get_device_details(ifname)
+        addresses = details.get("ipv4", [])
+        if state == "connected":
+            if config.get("method") == "auto" and addresses:
+                return CommandResult(True, "有线 DHCP 配置已生效")
+            if config.get("method") == "manual" and expected_address in addresses:
+                return CommandResult(True, "有线静态地址已生效")
+        time.sleep(1)
+    return CommandResult(False, f"{ifname} 未能使用新配置连接")
+
+
+def _rollback_wired_profile(
+    ifname: str,
+    profile_uuid: str,
+    original: dict[str, Any],
+) -> str:
+    restored = _modify_wired_profile(profile_uuid, original)
+    if not restored.ok:
+        return restored.output or "恢复原有线配置失败"
+    if get_wired_carrier(ifname) == "0":
+        return ""
+    activated = run_command(
+        ["nmcli", "connection", "up", "uuid", profile_uuid, "ifname", ifname],
+        timeout=40,
+    )
+    return "" if activated.ok else (activated.output or "重新激活原有线配置失败")
+
+
+def apply_wired_profile(ifname: str, config: dict[str, Any]) -> CommandResult:
+    profiles, profile_errors = get_wired_connection_profiles()
+    if profile_errors:
+        return CommandResult(False, profile_errors[0])
+    active_uuid = get_active_wired_connection(ifname).get("uuid", "")
+    device_mac = "" if active_uuid else get_device_details(ifname).get("mac", "")
+    profile = select_wired_connection_profile(ifname, active_uuid, device_mac, profiles)
+    profile_uuid = profile.get("uuid", "")
+    created = False
+    created_name = f"Linux Router {ifname}"
+
+    if not profile_uuid:
+        added = run_command(
+            [
+                "nmcli",
+                "connection",
+                "add",
+                "type",
+                "ethernet",
+                "ifname",
+                ifname,
+                "con-name",
+                created_name,
+            ],
+            timeout=20,
+        )
+        if not added.ok:
+            return added
+        created = True
+        profiles, profile_errors = get_wired_connection_profiles()
+        if profile_errors:
+            run_command(["nmcli", "connection", "delete", "id", created_name], timeout=15)
+            return CommandResult(False, profile_errors[0])
+        profile = select_wired_connection_profile(ifname, "", device_mac, profiles)
+        profile_uuid = profile.get("uuid", "")
+        if not profile_uuid:
+            run_command(["nmcli", "connection", "delete", "id", created_name], timeout=15)
+            return CommandResult(False, "已创建有线连接，但无法读取连接编号")
+
+    original = _wired_profile_config(profile)
+    modified = _modify_wired_profile(profile_uuid, config)
+    if not modified.ok:
+        if created:
+            run_command(["nmcli", "connection", "delete", "uuid", profile_uuid], timeout=15)
+        return modified
+
+    if get_wired_carrier(ifname) == "0":
+        return CommandResult(True, "有线配置已保存，连接网线后生效")
+
+    activated = run_command(
+        ["nmcli", "connection", "up", "uuid", profile_uuid, "ifname", ifname],
+        timeout=40,
+    )
+    result = activated if not activated.ok else _verify_wired_profile(ifname, config)
+    if result.ok:
+        return result
+
+    if created:
+        deleted = run_command(
+            ["nmcli", "connection", "delete", "uuid", profile_uuid],
+            timeout=15,
+        )
+        cleanup_error = "" if deleted.ok else (deleted.output or "清理新有线配置失败")
+    else:
+        cleanup_error = _rollback_wired_profile(ifname, profile_uuid, original)
+    if cleanup_error:
+        return CommandResult(
+            False,
+            f"{result.output or '应用有线配置失败'}；恢复原配置失败：{cleanup_error}",
+        )
+    return CommandResult(
+        False,
+        f"{result.output or '应用有线配置失败'}，已恢复原配置",
+    )
 
 
 def delete_inactive_hotspot_profiles() -> str | None:
@@ -583,6 +730,7 @@ __all__ = [
     "forget_wifi_profile",
     "start_hotspot_profile",
     "stop_hotspot_profile",
+    "apply_wired_profile",
     "configure_hotspot_keepalive",
     "get_interface_permanent_mac",
     "hotspot_keepalive_is_online",

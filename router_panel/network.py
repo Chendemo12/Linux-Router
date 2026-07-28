@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 from configparser import ConfigParser
+from ipaddress import IPv4Interface
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ from .core import (
     run_command,
     set_timed_cache,
 )
-from .contracts import HotspotClientsStatus, HotspotStatus, WirelessStatus
+from .contracts import HotspotClientsStatus, HotspotStatus, WiredProfile, WiredStatus, WirelessStatus
 from .hotspot_keepalive import get_hotspot_keepalive_runtime, load_hotspot_keepalive
 
 from .network_parsers import (
@@ -616,6 +617,18 @@ def get_active_wifi_connection(ifname: str) -> dict[str, str]:
         return {}
     for item in parse_nmcli_lines(result.output, ["name", "uuid", "type", "device"]):
         if item.get("type") == "802-11-wireless" and item.get("device") == ifname:
+            return item
+    return {}
+
+
+def get_active_wired_connection(ifname: str) -> dict[str, str]:
+    result = run_command(
+        ["nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active"]
+    )
+    if not result.ok or not result.output:
+        return {}
+    for item in parse_nmcli_lines(result.output, ["name", "uuid", "type", "device"]):
+        if item.get("type") == "802-3-ethernet" and item.get("device") == ifname:
             return item
     return {}
 
@@ -1224,18 +1237,141 @@ def get_wifi_networks(ifname: str) -> tuple[list[dict[str, Any]], str | None]:
     return networks, None
 
 
-def default_wired_profile(ifname: str) -> dict[str, Any]:
+def default_wired_profile(ifname: str) -> WiredProfile:
     return {
+        "uuid": "",
         "name": "",
-        "active_device": ifname,
         "interface_name": ifname,
+        "mac_address": "",
         "autoconnect": True,
         "ipv4_method": "auto",
+        "ipv4_method_label": "DHCP",
         "ipv4_address": "",
-        "ipv4_gateway": "",
-        "ipv4_dns": "",
-        "route_metric": "-1",
+        "prefix_length": 24,
+        "netmask": "255.255.255.0",
+        "gateway": "",
+        "dns": [],
+        "automatic_dns": True,
+        "configurable": True,
+        "configuration_error": "",
     }
+
+
+def get_wired_connection_profiles() -> tuple[list[WiredProfile], list[str]]:
+    result = run_command(
+        ["nmcli", "-t", "-f", "NAME,UUID,TYPE,AUTOCONNECT", "connection", "show"]
+    )
+    if not result.ok:
+        return [], [result.output or "无法读取有线连接配置"]
+    if not result.output:
+        return [], []
+
+    profiles: list[WiredProfile] = []
+    errors: list[str] = []
+    for item in parse_nmcli_lines(
+        result.output,
+        ["name", "uuid", "type", "autoconnect"],
+    ):
+        if item.get("type") != "802-3-ethernet" or not item.get("uuid"):
+            continue
+        details = run_command(
+            [
+                "nmcli",
+                "-g",
+                (
+                    "connection.id,connection.uuid,connection.interface-name,"
+                    "802-3-ethernet.mac-address,connection.autoconnect,ipv4.method,"
+                    "ipv4.addresses,ipv4.gateway,ipv4.dns,ipv4.ignore-auto-dns"
+                ),
+                "connection",
+                "show",
+                "uuid",
+                item["uuid"],
+            ]
+        )
+        if not details.ok or not details.output:
+            errors.append(
+                f"无法读取有线连接 {item.get('name', '') or item['uuid']}："
+                f"{details.output or '连接详情为空'}"
+            )
+            continue
+        lines = details.output.splitlines()
+        values = lines + [""] * (10 - len(lines))
+        addresses = parse_csv_values(values[6])
+        dns = parse_csv_values(values[8])
+        ipv4_address = ""
+        prefix_length = 24
+        netmask = "255.255.255.0"
+        if addresses:
+            try:
+                interface = IPv4Interface(addresses[0])
+            except ValueError:
+                pass
+            else:
+                ipv4_address = str(interface.ip)
+                prefix_length = interface.network.prefixlen
+                netmask = str(interface.network.netmask)
+
+        method = values[5].strip()
+        configuration_error = ""
+        if method not in {"auto", "manual"}:
+            configuration_error = "该连接使用当前页面不支持的 IPv4 模式"
+        elif method == "auto" and addresses:
+            configuration_error = "该 DHCP 连接配置了附加静态 IPv4 地址，请使用 NetworkManager 管理"
+        elif method == "manual" and (not addresses or not ipv4_address):
+            configuration_error = "该连接的静态 IPv4 地址无法识别，请使用 NetworkManager 管理"
+        elif len(addresses) > 1:
+            configuration_error = "该连接配置了多个 IPv4 地址，请使用 NetworkManager 管理"
+        elif len(dns) > 2:
+            configuration_error = "该连接配置了超过两个 DNS，请使用 NetworkManager 管理"
+
+        profiles.append(
+            {
+                "uuid": values[1].strip() or item["uuid"],
+                "name": values[0].strip() or item.get("name", ""),
+                "interface_name": values[2].strip(),
+                "mac_address": normalize_mac_address(values[3]),
+                "autoconnect": values[4].strip() == "yes",
+                "ipv4_method": method,
+                "ipv4_method_label": translate_ipv4_method(method),
+                "ipv4_address": ipv4_address,
+                "prefix_length": prefix_length,
+                "netmask": netmask,
+                "gateway": values[7].strip(),
+                "dns": dns,
+                "automatic_dns": values[9].strip() != "yes",
+                "configurable": not configuration_error,
+                "configuration_error": configuration_error,
+            }
+        )
+    return profiles, errors
+
+
+def select_wired_connection_profile(
+    ifname: str,
+    active_uuid: str,
+    device_mac: str,
+    profiles: list[WiredProfile],
+) -> WiredProfile:
+    if active_uuid:
+        active = next((item for item in profiles if item.get("uuid") == active_uuid), None)
+        if active:
+            return active
+
+    normalized_mac = normalize_mac_address(device_mac)
+    candidates = [
+        item
+        for item in profiles
+        if item.get("interface_name") == ifname
+        or normalized_mac and item.get("mac_address") == normalized_mac
+    ]
+    candidates.sort(
+        key=lambda item: (
+            not item.get("autoconnect", False),
+            item.get("name", "").lower(),
+        )
+    )
+    return candidates[0] if candidates else default_wired_profile(ifname)
 
 
 def parse_link_speed_mbps(value: str) -> int:
@@ -1283,19 +1419,7 @@ def translate_ipv4_method(value: str) -> str:
     return "未知"
 
 
-def get_wired_ipv4_method_label(connection_name: str) -> str:
-    if not connection_name:
-        return "未知"
-    result = run_command(
-        ["nmcli", "-g", "ipv4.method", "connection", "show", "id", connection_name],
-        timeout=5,
-    )
-    if not result.ok:
-        return "未知"
-    return translate_ipv4_method(result.output)
-
-
-def gather_wired_network_info() -> dict[str, Any]:
+def gather_wired_network_info() -> WiredStatus:
     result = run_command(
         [
             "nmcli",
@@ -1303,7 +1427,7 @@ def gather_wired_network_info() -> dict[str, Any]:
             "-f",
             (
                 "GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION,"
-                "GENERAL.HWADDR,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS"
+                "GENERAL.CON-UUID,GENERAL.HWADDR,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS"
             ),
             "device",
             "show",
@@ -1312,6 +1436,7 @@ def gather_wired_network_info() -> dict[str, Any]:
     if not result.ok or not result.output:
         return {
             "devices": [],
+            "dhcp_interface_count": 0,
             "errors": [result.output or "无法读取有线网络状态"],
         }
 
@@ -1331,6 +1456,7 @@ def gather_wired_network_info() -> dict[str, Any]:
                 "type": "",
                 "state": "",
                 "connection": "",
+                "connection_uuid": "",
                 "mac": "",
                 "ipv4": [],
                 "gateway": "",
@@ -1346,6 +1472,8 @@ def gather_wired_network_info() -> dict[str, Any]:
             current["state"] = normalize_nmcli_general_state(value)
         elif key == "GENERAL.CONNECTION":
             current["connection"] = "" if value == "--" else value
+        elif key == "GENERAL.CON-UUID":
+            current["connection_uuid"] = "" if value == "--" else value
         elif key == "GENERAL.HWADDR":
             current["mac"] = value
         elif key.startswith("IP4.ADDRESS"):
@@ -1357,18 +1485,45 @@ def gather_wired_network_info() -> dict[str, Any]:
     if current:
         raw_devices.append(current)
 
-    devices: list[dict[str, Any]] = []
+    profiles, profile_errors = get_wired_connection_profiles()
+    physical_ifnames = {
+        item.get("name", "") for item in get_network_interface_hardware()
+    }
+    devices = []
     for device in sorted(raw_devices, key=lambda value: value.get("device", "")):
-        if device.get("type") != "ethernet":
+        if (
+            device.get("type") != "ethernet"
+            or device.get("device", "") not in physical_ifnames
+        ):
             continue
         ifname = device.get("device", "")
         connection_name = device.get("connection", "")
         carrier = get_wired_carrier(ifname)
         state = normalize_wired_state(device.get("state", ""), carrier)
         speed = "" if carrier == "0" else get_wired_sysfs_speed(ifname)
-        profile = default_wired_profile(ifname)
-        profile["name"] = connection_name
-        profile["ipv4_method_label"] = get_wired_ipv4_method_label(connection_name)
+        profile = select_wired_connection_profile(
+            ifname,
+            device.get("connection_uuid", ""),
+            device.get("mac", ""),
+            profiles,
+        )
+        if state == "unmanaged":
+            profile = {
+                **profile,
+                "configurable": False,
+                "configuration_error": "该网口未由 NetworkManager 管理，当前不能通过面板配置",
+            }
+        elif profile_errors:
+            profile = {
+                **profile,
+                "configurable": False,
+                "configuration_error": "无法完整读取有线连接配置，当前不能通过面板修改",
+            }
+        is_dhcp = bool(
+            state != "unmanaged"
+            and profile.get("uuid")
+            and profile.get("ipv4_method") == "auto"
+        )
         devices.append(
             {
                 "device": ifname,
@@ -1384,12 +1539,14 @@ def gather_wired_network_info() -> dict[str, Any]:
                     "dns": device.get("dns", []),
                 },
                 "profile": profile,
+                "is_dhcp": is_dhcp,
             }
         )
 
     return {
         "devices": devices,
-        "errors": [],
+        "dhcp_interface_count": sum(1 for item in devices if item["is_dhcp"]),
+        "errors": profile_errors,
     }
 
 
@@ -1420,6 +1577,7 @@ __all__ = [
     "get_device_details",
     "get_wifi_connection_profiles",
     "get_active_wifi_connection",
+    "get_active_wired_connection",
     "get_saved_wifi_networks",
     "get_wifi_client_link",
     "get_wifi_scan_unavailable_reason",
@@ -1438,6 +1596,9 @@ __all__ = [
     "gather_hotspot_clients_status",
     "get_wifi_networks",
     "default_wired_profile",
+    "get_wired_connection_profiles",
+    "select_wired_connection_profile",
+    "get_wired_carrier",
     "translate_ipv4_method",
     "gather_wired_network_info",
 ]

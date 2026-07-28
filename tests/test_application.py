@@ -68,6 +68,7 @@ EXPECTED_ROUTES = {
     "/wifi/forget",
     "/wifi/rescan",
     "/wired",
+    "/wired/apply",
 }
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -467,11 +468,13 @@ class ApplicationStructureTests(unittest.TestCase):
                 "GENERAL.TYPE:ethernet",
                 "GENERAL.STATE:20 (unavailable)",
                 "GENERAL.CONNECTION:--",
+                "GENERAL.CON-UUID:--",
                 "GENERAL.HWADDR:AA:BB:CC:DD:EE:FF",
                 "GENERAL.DEVICE:eth1",
                 "GENERAL.TYPE:ethernet",
                 "GENERAL.STATE:100 (connected)",
                 "GENERAL.CONNECTION:uplink",
+                "GENERAL.CON-UUID:11111111-1111-4111-8111-111111111111",
                 "GENERAL.HWADDR:AA:BB:CC:DD:EE:00",
                 "IP4.ADDRESS[1]:192.168.1.2/24",
                 "IP4.GATEWAY:192.168.1.1",
@@ -493,10 +496,35 @@ class ApplicationStructureTests(unittest.TestCase):
                 "run_command",
                 side_effect=[
                     CommandResult(True, nmcli_output),
-                    CommandResult(True, "manual"),
+                    CommandResult(
+                        True,
+                        "uplink:11111111-1111-4111-8111-111111111111:802-3-ethernet:yes",
+                    ),
+                    CommandResult(
+                        True,
+                        "\n".join(
+                            [
+                                "uplink",
+                                "11111111-1111-4111-8111-111111111111",
+                                "eth1",
+                                "AA:BB:CC:DD:EE:00",
+                                "yes",
+                                "manual",
+                                "192.168.1.2/24",
+                                "192.168.1.1",
+                                "1.1.1.1",
+                                "yes",
+                            ]
+                        ),
+                    ),
                 ],
             ) as run_command,
             patch.object(network, "read_text", side_effect=read_sysfs),
+            patch.object(
+                network,
+                "get_network_interface_hardware",
+                return_value=[{"name": "eth0"}, {"name": "eth1"}],
+            ),
         ):
             wired = network.gather_wired_network_info()
 
@@ -507,11 +535,13 @@ class ApplicationStructureTests(unittest.TestCase):
         self.assertEqual(eth0["state_label"], "未连接")
         self.assertEqual(eth0["details"]["carrier"], "0")
         self.assertEqual(eth0["details"]["link_speed"], "未知")
-        self.assertEqual(eth0["profile"]["ipv4_method_label"], "未知")
+        self.assertEqual(eth0["profile"]["ipv4_method_label"], "DHCP")
         self.assertEqual(eth1["state"], "connected")
         self.assertEqual(eth1["details"]["carrier"], "1")
         self.assertEqual(eth1["details"]["link_speed"], "2.5 Gbps")
         self.assertEqual(eth1["profile"]["ipv4_method_label"], "静态地址")
+        self.assertEqual(eth1["profile"]["netmask"], "255.255.255.0")
+        self.assertEqual(wired["dhcp_interface_count"], 0)
 
     def test_wired_template_shows_negotiated_speed(self):
         template = (Path(__file__).parent.parent / "templates" / "wired.html").read_text()
@@ -526,10 +556,488 @@ class ApplicationStructureTests(unittest.TestCase):
         self.assertNotIn("当前网关", template)
         self.assertNotIn("当前 DNS", template)
 
+    def test_wired_dhcp_profile_with_static_address_is_not_configurable(self):
+        with patch.object(
+            network,
+            "run_command",
+            side_effect=[
+                CommandResult(
+                    True,
+                    "uplink:11111111-1111-4111-8111-111111111111:802-3-ethernet:yes",
+                ),
+                CommandResult(
+                    True,
+                    "\n".join(
+                        [
+                            "uplink",
+                            "11111111-1111-4111-8111-111111111111",
+                            "eth0",
+                            "AA:BB:CC:DD:EE:FF",
+                            "yes",
+                            "auto",
+                            "192.168.1.20/24",
+                            "",
+                            "1.1.1.1",
+                            "yes",
+                        ]
+                    ),
+                ),
+            ],
+        ):
+            profiles, errors = network.get_wired_connection_profiles()
+
+        self.assertEqual(errors, [])
+        self.assertFalse(profiles[0]["configurable"])
+        self.assertIn("附加静态 IPv4 地址", profiles[0]["configuration_error"])
+
+    def test_wired_profile_reader_accepts_empty_connection_list(self):
+        with patch.object(
+            network,
+            "run_command",
+            return_value=CommandResult(True, ""),
+        ):
+            profiles, errors = network.get_wired_connection_profiles()
+
+        self.assertEqual(profiles, [])
+        self.assertEqual(errors, [])
+
+    def test_wired_status_excludes_virtual_ethernet_interfaces(self):
+        nmcli_output = "\n".join(
+            [
+                "GENERAL.DEVICE:eth0",
+                "GENERAL.TYPE:ethernet",
+                "GENERAL.STATE:20 (unavailable)",
+                "GENERAL.CONNECTION:--",
+                "GENERAL.CON-UUID:--",
+                "GENERAL.HWADDR:AA:BB:CC:DD:EE:FF",
+                "GENERAL.DEVICE:veth0",
+                "GENERAL.TYPE:ethernet",
+                "GENERAL.STATE:30 (disconnected)",
+                "GENERAL.CONNECTION:--",
+                "GENERAL.CON-UUID:--",
+                "GENERAL.HWADDR:AA:BB:CC:DD:EE:00",
+            ]
+        )
+        with (
+            patch.object(network, "run_command", return_value=CommandResult(True, nmcli_output)),
+            patch.object(network, "get_wired_connection_profiles", return_value=([], [])),
+            patch.object(
+                network,
+                "get_network_interface_hardware",
+                return_value=[{"name": "eth0"}],
+            ),
+            patch.object(network, "read_text", return_value="0"),
+        ):
+            wired = network.gather_wired_network_info()
+
+        self.assertEqual([item["device"] for item in wired["devices"]], ["eth0"])
+
+    def test_wired_interface_validation_rejects_virtual_ethernet(self):
+        with (
+            patch.object(
+                agent_server,
+                "get_device_status_item",
+                return_value={"device": "veth0", "type": "ethernet"},
+            ),
+            patch.object(
+                agent_server,
+                "get_network_interface_hardware",
+                return_value=[{"name": "eth0"}],
+            ),
+        ):
+            with self.assertRaises(agent_server.ValidationError):
+                agent_server._require_wired_interface({"ifname": "veth0"})
+
     def test_ipv4_method_labels_are_user_facing(self):
         self.assertEqual(network.translate_ipv4_method("auto"), "DHCP")
         self.assertEqual(network.translate_ipv4_method("manual"), "静态地址")
         self.assertEqual(network.translate_ipv4_method("disabled"), "未知")
+
+    def test_wired_static_config_normalizes_netmask_and_dns(self):
+        with patch.object(
+            agent_server,
+            "load_network_config",
+            return_value={"lan_network": "192.168.50.0/24"},
+        ):
+            config = agent_server._normalize_wired_config(
+                {
+                    "ipv4_method": "manual",
+                    "ipv4_address": "10.20.30.40",
+                    "netmask": "255.255.255.0",
+                    "gateway": "10.20.30.1",
+                    "primary_dns": "1.1.1.1",
+                    "secondary_dns": "1.1.1.1",
+                }
+            )
+
+        self.assertEqual(config["address"], "10.20.30.40/24")
+        self.assertEqual(config["gateway"], "10.20.30.1")
+        self.assertEqual(config["dns"], ["1.1.1.1"])
+
+    def test_wired_static_config_rejects_invalid_network_values(self):
+        with patch.object(
+            agent_server,
+            "load_network_config",
+            return_value={"lan_network": "192.168.50.0/24"},
+        ):
+            with self.assertRaises(agent_server.ValidationError):
+                agent_server._normalize_wired_config(
+                    {
+                        "ipv4_method": "manual",
+                        "ipv4_address": "192.168.1.0",
+                        "netmask": "255.255.255.0",
+                    }
+                )
+            with self.assertRaises(agent_server.ValidationError):
+                agent_server._normalize_wired_config(
+                    {
+                        "ipv4_method": "manual",
+                        "ipv4_address": "10.0.0.2",
+                        "netmask": "255.0.255.0",
+                    }
+                )
+            with self.assertRaises(agent_server.ValidationError):
+                agent_server._normalize_wired_config(
+                    {
+                        "ipv4_method": "manual",
+                        "ipv4_address": "10.0.0.2",
+                        "netmask": "255.255.255.0",
+                        "gateway": "10.0.1.1",
+                    }
+                )
+            with self.assertRaises(agent_server.ValidationError):
+                agent_server._normalize_wired_config(
+                    {
+                        "ipv4_method": "manual",
+                        "ipv4_address": "192.168.50.2",
+                        "netmask": "255.255.255.0",
+                    }
+                )
+
+    def test_wired_dhcp_supports_automatic_and_manual_dns(self):
+        automatic = agent_server._normalize_wired_config(
+            {"ipv4_method": "auto", "dns_mode": "automatic"}
+        )
+        manual = agent_server._normalize_wired_config(
+            {
+                "ipv4_method": "auto",
+                "dns_mode": "manual",
+                "primary_dns": "223.5.5.5",
+                "secondary_dns": "1.1.1.1",
+            }
+        )
+
+        self.assertTrue(automatic["automatic_dns"])
+        self.assertEqual(automatic["dns"], [])
+        self.assertFalse(manual["automatic_dns"])
+        self.assertEqual(manual["dns"], ["223.5.5.5", "1.1.1.1"])
+
+    def test_wired_agent_preserves_at_least_one_dhcp_interface(self):
+        manual_config = {
+            "method": "manual",
+            "address": "10.0.0.2/24",
+            "gateway": "",
+            "dns": [],
+            "automatic_dns": False,
+        }
+        device = {
+            "device": "eth0",
+            "is_dhcp": True,
+            "profile": {"configurable": True, "configuration_error": ""},
+        }
+        with (
+            patch.object(agent_server, "_require_wired_interface", return_value="eth0"),
+            patch.object(agent_server, "_normalize_wired_config", return_value=manual_config),
+            patch.object(
+                agent_server,
+                "gather_wired_network_info",
+                return_value={"devices": [device], "dhcp_interface_count": 1, "errors": []},
+            ),
+            patch.object(agent_server, "apply_wired_profile") as apply_profile,
+        ):
+            with self.assertRaises(agent_server.ValidationError):
+                agent_server._execute_wired_apply({"ifname": "eth0"})
+        apply_profile.assert_not_called()
+
+    def test_wired_agent_allows_static_when_another_dhcp_exists(self):
+        manual_config = {
+            "method": "manual",
+            "address": "10.0.0.2/24",
+            "gateway": "",
+            "dns": [],
+            "automatic_dns": False,
+        }
+        devices = [
+            {
+                "device": "eth0",
+                "is_dhcp": True,
+                "profile": {"configurable": True, "configuration_error": ""},
+            },
+            {
+                "device": "eth1",
+                "is_dhcp": True,
+                "profile": {"configurable": True, "configuration_error": ""},
+            },
+        ]
+        with (
+            patch.object(agent_server, "_require_wired_interface", return_value="eth0"),
+            patch.object(agent_server, "_normalize_wired_config", return_value=manual_config),
+            patch.object(
+                agent_server,
+                "gather_wired_network_info",
+                return_value={"devices": devices, "dhcp_interface_count": 2, "errors": []},
+            ),
+            patch.object(
+                agent_server,
+                "apply_wired_profile",
+                return_value=CommandResult(True, "applied"),
+            ) as apply_profile,
+        ):
+            result = agent_server._execute_wired_apply({"ifname": "eth0"})
+
+        self.assertTrue(result["ok"])
+        apply_profile.assert_called_once_with("eth0", manual_config)
+
+    def test_wired_agent_allows_dhcp_to_restore_all_static_system(self):
+        dhcp_config = {
+            "method": "auto",
+            "address": "",
+            "gateway": "",
+            "dns": [],
+            "automatic_dns": True,
+        }
+        device = {
+            "device": "eth0",
+            "is_dhcp": False,
+            "profile": {"configurable": True, "configuration_error": ""},
+        }
+        with (
+            patch.object(agent_server, "_require_wired_interface", return_value="eth0"),
+            patch.object(agent_server, "_normalize_wired_config", return_value=dhcp_config),
+            patch.object(
+                agent_server,
+                "gather_wired_network_info",
+                return_value={"devices": [device], "dhcp_interface_count": 0, "errors": []},
+            ),
+            patch.object(
+                agent_server,
+                "apply_wired_profile",
+                return_value=CommandResult(True, "applied"),
+            ) as apply_profile,
+        ):
+            result = agent_server._execute_wired_apply({"ifname": "eth0"})
+
+        self.assertTrue(result["ok"])
+        apply_profile.assert_called_once_with("eth0", dhcp_config)
+
+    def test_wired_profile_selection_uses_bound_mac_when_disconnected(self):
+        profile = network.default_wired_profile("")
+        profile.update(
+            {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "mac_address": "AA:BB:CC:DD:EE:FF",
+            }
+        )
+
+        selected = network.select_wired_connection_profile(
+            "eth0",
+            "",
+            "aa-bb-cc-dd-ee-ff",
+            [profile],
+        )
+
+        self.assertEqual(selected["uuid"], profile["uuid"])
+
+    def test_wired_profile_apply_does_not_change_routing_or_autoconnect(self):
+        profile = network.default_wired_profile("eth0")
+        profile.update(
+            {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "name": "uplink",
+            }
+        )
+        config = {
+            "method": "auto",
+            "address": "",
+            "gateway": "",
+            "dns": [],
+            "automatic_dns": True,
+        }
+        with (
+            patch.object(
+                network_operations,
+                "get_wired_connection_profiles",
+                return_value=([profile], []),
+            ),
+            patch.object(
+                network_operations,
+                "get_active_wired_connection",
+                return_value={"uuid": profile["uuid"]},
+            ),
+            patch.object(network_operations, "get_wired_carrier", return_value="1"),
+            patch.object(
+                network_operations,
+                "_verify_wired_profile",
+                return_value=CommandResult(True, "verified"),
+            ),
+            patch.object(
+                network_operations,
+                "run_command",
+                side_effect=[CommandResult(True, "modified"), CommandResult(True, "activated")],
+            ) as run,
+        ):
+            result = network_operations.apply_wired_profile("eth0", config)
+
+        self.assertTrue(result.ok)
+        command = run.call_args_list[0].args[0]
+        self.assertNotIn("connection.autoconnect", command)
+        self.assertNotIn("ipv4.route-metric", command)
+        self.assertNotIn("ipv4.never-default", command)
+
+    def test_wired_profile_read_error_prevents_changes(self):
+        config = {
+            "method": "auto",
+            "address": "",
+            "gateway": "",
+            "dns": [],
+            "automatic_dns": True,
+        }
+        with (
+            patch.object(
+                network_operations,
+                "get_wired_connection_profiles",
+                return_value=([], ["无法读取有线连接 uplink"]),
+            ),
+            patch.object(network_operations, "run_command") as run,
+        ):
+            result = network_operations.apply_wired_profile("eth0", config)
+
+        self.assertFalse(result.ok)
+        self.assertIn("无法读取有线连接", result.output)
+        run.assert_not_called()
+
+    def test_wired_profile_restores_original_after_activation_failure(self):
+        profile = network.default_wired_profile("eth0")
+        profile.update(
+            {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "name": "uplink",
+            }
+        )
+        config = {
+            "method": "manual",
+            "address": "10.0.0.2/24",
+            "gateway": "10.0.0.1",
+            "dns": ["1.1.1.1"],
+            "automatic_dns": False,
+        }
+        with (
+            patch.object(
+                network_operations,
+                "get_wired_connection_profiles",
+                return_value=([profile], []),
+            ),
+            patch.object(
+                network_operations,
+                "get_active_wired_connection",
+                return_value={"uuid": profile["uuid"]},
+            ),
+            patch.object(network_operations, "get_wired_carrier", return_value="1"),
+            patch.object(
+                network_operations,
+                "run_command",
+                side_effect=[
+                    CommandResult(True, "modified"),
+                    CommandResult(False, "activation failed"),
+                    CommandResult(True, "restored"),
+                    CommandResult(True, "reactivated"),
+                ],
+            ) as run,
+        ):
+            result = network_operations.apply_wired_profile("eth0", config)
+
+        self.assertFalse(result.ok)
+        self.assertIn("已恢复原配置", result.output)
+        self.assertEqual(run.call_count, 4)
+
+    def test_new_wired_profile_is_deleted_after_activation_failure(self):
+        created_profile = network.default_wired_profile("eth0")
+        created_profile.update(
+            {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "name": "Linux Router eth0",
+            }
+        )
+        config = {
+            "method": "auto",
+            "address": "",
+            "gateway": "",
+            "dns": [],
+            "automatic_dns": True,
+        }
+        with (
+            patch.object(
+                network_operations,
+                "get_wired_connection_profiles",
+                side_effect=[([], []), ([created_profile], [])],
+            ),
+            patch.object(network_operations, "get_active_wired_connection", return_value={}),
+            patch.object(
+                network_operations,
+                "get_device_details",
+                return_value={"mac": "AA:BB:CC:DD:EE:FF"},
+            ),
+            patch.object(network_operations, "get_wired_carrier", return_value="1"),
+            patch.object(
+                network_operations,
+                "run_command",
+                side_effect=[
+                    CommandResult(True, "created"),
+                    CommandResult(True, "modified"),
+                    CommandResult(False, "activation failed"),
+                    CommandResult(True, "deleted"),
+                ],
+            ) as run,
+        ):
+            result = network_operations.apply_wired_profile("eth0", config)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(run.call_args_list[-1].args[0][2:5], ["delete", "uuid", created_profile["uuid"]])
+
+    def test_async_wired_apply_returns_operation_id(self):
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+
+        with patch(
+            "router_panel.web_general.submit_operation",
+            return_value={"id": "11111111-1111-4111-8111-111111111111"},
+        ) as submit:
+            response = client.post(
+                "/wired/apply",
+                data={
+                    "csrf_token": "test-token",
+                    "ifname": "eth0",
+                    "ipv4_method": "auto",
+                    "dns_mode": "automatic",
+                },
+                headers={"X-Requested-With": "fetch"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["pending"])
+        self.assertEqual(submit.call_args.kwargs["scope"], "wired")
+
+    def test_wired_template_keeps_minimal_configuration_controls(self):
+        template = (Path(__file__).parent.parent / "templates" / "wired.html").read_text()
+        self.assertIn("data-configure-wired", template)
+        self.assertIn("modal-panel-narrow", template)
+        self.assertIn("子网掩码", template)
+        self.assertIn("至少保留一个使用 DHCP 的有线网口", template)
+        self.assertNotIn("路由优先级", template)
+        self.assertNotIn("开机自动连接", template)
 
     def test_nmcli_fixture_preserves_escaped_connection_name(self):
         rows = network_parsers.parse_nmcli_lines(

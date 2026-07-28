@@ -15,7 +15,7 @@ Linux Router 可以将 Debian 或 Armbian 设备变成路由器，并提供一�
 
 - 系统概览：硬件信息、IP 地址、活动连接、存储、内存和运行状态
 - 依赖检查与修复：NetworkManager、wpa_supplicant、dnsmasq、iptables、`iw` 等运行环境
-- 有线和 Wi-Fi 管理：扫描、连接、断开、配置绑定和忘记网络
+- 有线和 Wi-Fi 管理：有线 DHCP 与静态 IPv4 配置并保留 DHCP 恢复入口，以及 Wi-Fi 扫描、连接、断开、配置绑定和忘记网络
 - 热点创建：支持独占 AP，以及网卡能力允许时的 AP+STA 并发模式
 - 热点设备：查看客户端、DHCP 租约、无线信号和 LAN 网段配置
 - 热点保活：热点异常断线后自动尝试恢复

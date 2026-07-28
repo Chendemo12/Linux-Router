@@ -158,8 +158,36 @@ def register_general_routes(app, login_required, is_async_request) -> None:
         try:
             wired = query_agent("wired_status")
         except AgentError as exc:
-            wired = {"devices": [], "errors": [str(exc)]}
+            wired = {"devices": [], "dhcp_interface_count": 0, "errors": [str(exc)]}
         return render_template("wired.html", wired=wired)
+
+
+    @app.route("/wired/apply", methods=["POST"])
+    @login_required
+    def wired_apply():
+        params = {
+            "ifname": request.form.get("ifname", "").strip(),
+            "ipv4_method": request.form.get("ipv4_method", "").strip(),
+            "dns_mode": request.form.get("dns_mode", "").strip(),
+            "ipv4_address": request.form.get("ipv4_address", "").strip(),
+            "netmask": request.form.get("netmask", "").strip(),
+            "gateway": request.form.get("gateway", "").strip(),
+            "primary_dns": request.form.get("primary_dns", "").strip(),
+            "secondary_dns": request.form.get("secondary_dns", "").strip(),
+        }
+        try:
+            operation = submit_operation(
+                "wired_apply",
+                params,
+                scope="wired",
+                context={"ifname": params["ifname"]},
+            )
+        except AgentError as exc:
+            if is_async_request():
+                return {"ok": False, "pending": False, "message": str(exc)}, 503
+            flash(str(exc), "error")
+            return redirect(url_for("wired_network"))
+        return queued_response(operation, "有线配置已加入队列", "wired_network")
 
 
     @app.route("/healthz")

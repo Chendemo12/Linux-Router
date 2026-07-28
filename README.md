@@ -15,7 +15,7 @@ Linux Router is built with Flask, NetworkManager, and systemd. The Web service r
 
 - System overview with hardware, IP addresses, active connections, storage, memory, and runtime status
 - Dependency checks and guided repair for NetworkManager, wpa_supplicant, dnsmasq, iptables, `iw`, and related tools
-- Wired and Wi-Fi management, including scanning, connecting, disconnecting, profile binding, and forgetting networks
+- Wired DHCP and static IPv4 configuration with a required DHCP recovery interface, plus Wi-Fi scanning, connecting, disconnecting, profile binding, and forgetting networks
 - Hotspot creation with exclusive AP and supported AP+STA concurrent modes
 - Hotspot client visibility, DHCP leases, wireless signal details, and LAN subnet configuration
 - Hotspot keepalive with automatic recovery after unexpected disconnection

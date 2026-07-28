@@ -80,6 +80,40 @@ class WifiConnectResult(TypedDict):
     hotspot_profile: dict[str, str]
 
 
+class WiredProfile(TypedDict):
+    uuid: str
+    name: str
+    interface_name: str
+    mac_address: str
+    autoconnect: bool
+    ipv4_method: str
+    ipv4_method_label: str
+    ipv4_address: str
+    prefix_length: int
+    netmask: str
+    gateway: str
+    dns: list[str]
+    automatic_dns: bool
+    configurable: bool
+    configuration_error: str
+
+
+class WiredDevice(TypedDict):
+    device: str
+    state: str
+    state_label: str
+    connection: str
+    details: dict[str, Any]
+    profile: WiredProfile
+    is_dhcp: bool
+
+
+class WiredStatus(TypedDict):
+    devices: list[WiredDevice]
+    dhcp_interface_count: int
+    errors: list[str]
+
+
 __all__ = [
     "WirelessStatus",
     "HotspotSummary",
@@ -88,4 +122,7 @@ __all__ = [
     "HotspotClientsStatus",
     "SystemInfo",
     "WifiConnectResult",
+    "WiredProfile",
+    "WiredDevice",
+    "WiredStatus",
 ]
