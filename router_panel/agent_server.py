@@ -445,7 +445,7 @@ def _execute_wired_apply(params: dict[str, Any]) -> dict[str, Any]:
         )
         if remaining_dhcp < 1:
             raise ValidationError(
-                "Linux Router 要求至少保留一个使用 DHCP 的有线网口；"
+                "Linux Router 要求至少保留一个使用 DHCP 的有线网口，"
                 "如需全部使用静态地址，请通过 NetworkManager 或 nmcli 手动配置"
             )
     return _result(

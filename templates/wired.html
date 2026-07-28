@@ -117,9 +117,9 @@
         </label>
       </div>
       <p class="warning" id="wired-dhcp-required-warning" hidden>
-        Linux Router 要求至少保留一个使用 DHCP 的有线网口。如需全部使用静态地址，请通过 NetworkManager 或 nmcli 手动配置。
+        Linux Router 要求至少保留一个使用 DHCP 的有线网口，如需全部使用静态地址，请通过 NetworkManager 或 nmcli 手动配置
       </p>
-      <p class="muted form-hint">应用配置时该网口连接可能暂时中断。</p>
+      <p class="muted form-hint">应用配置时该网口连接可能暂时中断</p>
       <button type="submit">应用配置</button>
     </form>
   </div>
@@ -180,7 +180,7 @@
         field("gateway").value = profile.gateway || "";
         field("primary_dns").value = profile.dns?.[0] || "";
         field("secondary_dns").value = profile.dns?.[1] || "";
-        subtitle.textContent = `${selectedDevice.device} · 当前${profile.ipv4_method_label || "未知"}`;
+        subtitle.textContent = selectedDevice.device || "";
         updateFields();
         modal.classList.remove("hidden");
         modal.setAttribute("aria-hidden", "false");
@@ -191,9 +191,6 @@
     methodInput?.addEventListener("change", updateFields);
     dnsModeInput?.addEventListener("change", updateFields);
     document.getElementById("close-wired-modal-button")?.addEventListener("click", closeModal);
-    modal?.addEventListener("click", (event) => {
-      if (event.target === modal) closeModal();
-    });
     window.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && !modal?.classList.contains("hidden")) closeModal();
     });

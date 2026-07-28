@@ -1035,7 +1035,14 @@ class ApplicationStructureTests(unittest.TestCase):
         self.assertIn("data-configure-wired", template)
         self.assertIn("modal-panel-narrow", template)
         self.assertIn("子网掩码", template)
-        self.assertIn("至少保留一个使用 DHCP 的有线网口", template)
+        self.assertIn(
+            "Linux Router 要求至少保留一个使用 DHCP 的有线网口，如需全部使用静态地址，请通过 NetworkManager 或 nmcli 手动配置",
+            template,
+        )
+        self.assertIn("应用配置时该网口连接可能暂时中断", template)
+        self.assertIn('subtitle.textContent = selectedDevice.device || "";', template)
+        self.assertNotIn("event.target === modal", template)
+        self.assertNotIn("当前${profile.ipv4_method_label", template)
         self.assertNotIn("路由优先级", template)
         self.assertNotIn("开机自动连接", template)
 
