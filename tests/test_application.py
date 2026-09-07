@@ -187,6 +187,7 @@ class ApplicationStructureTests(unittest.TestCase):
                 response = client.get("/settings")
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn(f"Version {core.VERSION}".encode(), response.data)
         self.assertIn(b"Branch dev", response.data)
         self.assertIn(b"Build 67c4ce5", response.data)
         self.assertIn(b"https://github.com/Jaksay/Linux-Router", response.data)

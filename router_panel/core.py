@@ -25,6 +25,7 @@ NETWORK_CONFIG_PATH = DATA_DIR / "network.json"
 PASSWORD_HINT_PATH = DATA_DIR / "initial_password.txt"
 SECRET_KEY_PATH = DATA_DIR / "secret_key"
 BUILD_INFO_PATH = BASE_DIR / "BUILD_INFO"
+VERSION = "1.0.0"
 HOTSPOT_CONNECTION_NAME = "DebianRouterHotspot"
 HOTSPOT_DEFAULT_SSID = "DebianRouter"
 HOTSPOT_VIRTUAL_INTERFACE_PREFIX = "ap-"
@@ -703,7 +704,7 @@ def save_network_config(lan_network: IPv4Network) -> None:
 
 
 def get_build_info() -> dict[str, str]:
-    info = {"branch": "unknown", "build": "unknown"}
+    info = {"version": VERSION, "branch": "unknown", "build": "unknown"}
     try:
         raw_lines = BUILD_INFO_PATH.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -738,6 +739,7 @@ __all__ = [
     "PASSWORD_HINT_PATH",
     "SECRET_KEY_PATH",
     "BUILD_INFO_PATH",
+    "VERSION",
     "HOTSPOT_CONNECTION_NAME",
     "HOTSPOT_DEFAULT_SSID",
     "HOTSPOT_VIRTUAL_INTERFACE_PREFIX",

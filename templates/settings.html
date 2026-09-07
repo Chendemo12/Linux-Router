@@ -65,6 +65,11 @@
 <footer class="settings-footer">
   <p class="muted settings-build-line">
     <span class="settings-build-item">
+      {{ icon("git-tag", 14, "settings-footer-icon") }}
+      <span>Version {{ build_info.version }}</span>
+    </span>
+    <span aria-hidden="true">·</span>
+    <span class="settings-build-item">
       {{ icon("git-branch", 14, "settings-footer-icon") }}
       <span>Branch {{ build_info.branch }}</span>
     </span>
