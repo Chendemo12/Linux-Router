@@ -431,6 +431,7 @@ def activate_hotspot_profile(
 
     if progress:
         progress("正在启动热点")
+    disconnect_device(hotspot_ifname)
     up_command = ["nmcli", "connection", "up", HOTSPOT_CONNECTION_NAME]
     if mode == "exclusive":
         up_command.extend(["ifname", hotspot_ifname])
@@ -462,6 +463,7 @@ def activate_hotspot_profile(
         time.sleep(2)
     if progress:
         progress("正在重试启动热点")
+    disconnect_device(hotspot_ifname)
     fallback_attempt = run_command(up_command, timeout=40)
     if fallback_attempt.ok:
         return fallback_attempt
@@ -601,6 +603,16 @@ def _connect_wifi_profile(
 
 def _disconnect_wifi(ifname: str) -> CommandResult:
     return run_command(["nmcli", "device", "disconnect", ifname], timeout=20)
+
+
+def disconnect_device(ifname: str) -> None:
+    """强制断开网卡，清掉残留的 STA/supplicant 状态，让热点从干净状态激活。
+
+    网卡当前可能没有任何活动连接，断开会失败；这里忽略错误，只作清理用。
+    """
+    if not ifname:
+        return
+    _disconnect_wifi(ifname)
 
 
 def _manage_networkmanager_interface(ifname: str) -> list[CommandResult]:
