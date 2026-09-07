@@ -383,3 +383,85 @@ python3 -m unittest tests.test_application
 ```
 
 修改 Web 代码或模板后重启 `router-panel.service`；修改 Agent、系统查询或网络操作后重启 `router-panel-agent.service`。生产环境应使用 systemd 管理的 Gunicorn 服务。
+
+## 12. 更新设备到 GitHub 上的最新代码
+
+如果设备最初由安装器（`install.sh`）部署，之后希望更新到仓库里最新的代码，推荐在**设备本身**上使用安装器的 `upgrade` 命令。安装器会在运行时从 GitHub 拉取源码压缩包并解压部署，因此目标设备无需安装 Git。
+
+`upgrade` 只替换程序文件和 systemd 服务定义，**保留**账号、密钥、LAN 配置等运行数据，且不重配网络；结束后会执行健康检查，失败时自动回滚到上一版本。纯代码改动（如本仓库的 `router_panel/`、`templates/`、`static/`）走 `upgrade` 即可，无需 `--apply-network-now`。
+
+> **关键提示**：安装器默认从 `https://github.com/Jaksay/Linux-Router` 的 `main` 分支拉取（`install.sh` 顶部默认值）。如果你的改动位于**自维护仓库的其它分支**（例如 fork 的 `dev`），必须显式指定 `--repo` 与 `--branch`；否则 `upgrade` 会拉取上游 `main`，不仅装不上你的改动，还可能覆盖设备上现有的程序文件。
+
+以自维护仓库 `Chendemo12/Linux-Router` 的 `dev` 分支为例：
+
+```bash
+# 拉取与你仓库/分支匹配的 install.sh
+curl -fsSL https://raw.githubusercontent.com/Chendemo12/Linux-Router/dev/install.sh \
+  -o /tmp/linux-router-install.sh
+
+# 用你的仓库 + dev 分支升级
+sudo bash /tmp/linux-router-install.sh upgrade \
+  --repo https://github.com/Chendemo12/Linux-Router.git \
+  --branch dev
+```
+
+也可用环境变量（`LINUX_ROUTER_REPO_URL`、`LINUX_ROUTER_BRANCH`）代替参数：
+
+```bash
+sudo env \
+  LINUX_ROUTER_REPO_URL=https://github.com/Chendemo12/Linux-Router.git \
+  LINUX_ROUTER_BRANCH=dev \
+  bash /tmp/linux-router-install.sh upgrade
+```
+
+如果安装目录不是默认的 `/opt/linux-router`（例如按本文使用 `$INSTALL_DIR`/`$DATA_DIR`），请补充：
+
+```bash
+sudo bash /tmp/linux-router-install.sh upgrade \
+  --repo https://github.com/Chendemo12/Linux-Router.git \
+  --branch dev \
+  --install-dir "$INSTALL_DIR" \
+  --data-dir "$DATA_DIR"
+```
+
+把示例中的仓库和分支替换成你自己的值。前提是目标设备能访问 GitHub，且对应分支的最新提交已推送。
+
+如果设备无法访问 GitHub（完全离线），先在能联网的机器上下载仓库源码压缩包并拷到设备，然后用 `--archive` 指定这个本地 tar 包安装或升级。此模式不访问 GitHub、也不下载，离线可用；构建标识会写为 `build=local`，`branch` 则沿用 `--branch` 的值：
+
+```bash
+# 在设备上，源码包已位于 /tmp/app.tar.gz
+sudo bash /tmp/linux-router-install.sh upgrade \
+  --archive /tmp/app.tar.gz \
+  --install-dir "$INSTALL_DIR" \
+  --data-dir "$DATA_DIR"
+```
+
+`--archive` 与 `--archive-url` 互斥；注意 `--archive-url` 只接受 HTTPS 且仍需联网解析分支，不能用于离线安装。若需要彻底脱离 tar 包，也可按本文第 2 节的方式用 `cp -a` 从源码目录手动更新。
+
+**离线升级之二：用代码目录（clone）替换（仅限已安装设备）**
+
+如果设备离线，但你能把一份完整代码目录（例如一份 git clone，或用 `git bundle` 生成后通过 U 盘/局域网拷入）放到设备上，也可以直接替换应用目录完成升级。它**只能用于“已经用安装器部署过”的设备**——首次安装所需的服务账号、`$DATA_DIR` 数据、systemd unit、netplan/IPv4 转发等在首次 `install` 时已就位，此处只替换程序文件。
+
+前提：
+- 设备必须已经安装过，且安装目录默认即 `/opt/linux-router`、数据目录 `/var/lib/linux-router`（或与你的 `$INSTALL_DIR`/`$DATA_DIR` 一致）；
+- 代码目录在设备上已就位（例如 `/opt/linux-router.new`）。
+
+```bash
+# 先备份当前版本，便于回滚
+sudo mv /opt/linux-router /opt/linux-router.previous
+sudo mv /opt/linux-router.new /opt/linux-router
+sudo chown -R root:root /opt/linux-router
+
+# 可选：写回 BUILD_INFO，否则页脚 build 显示 unknown
+printf 'branch=%s\nbuild=%s\n' \
+  "$(sudo git -C /opt/linux-router rev-parse --abbrev-ref HEAD 2>/dev/null || echo dev)" \
+  "$(sudo git -C /opt/linux-router rev-parse --short HEAD 2>/dev/null || echo local)" \
+  | sudo tee /opt/linux-router/BUILD_INFO >/dev/null
+
+# 重启两个服务以加载新代码
+sudo systemctl restart router-panel-agent.service router-panel.service
+```
+
+确认新版本运行正常后，再删除备份：`sudo rm -rf /opt/linux-router.previous`。若运行异常，用备份回滚并重启服务即可。
+
+> **不要**改动或删除 `/var/lib/linux-router`——账号、密钥、LAN 配置等运行数据都在其中，且与代码目录相互独立；替换 `/opt/linux-router` 不会影响它。`.git` 目录可保留，方便以后在联网时 `sudo git -C /opt/linux-router pull` 后再重启。

@@ -4,6 +4,7 @@ set -Eeuo pipefail
 REPO_URL="${LINUX_ROUTER_REPO_URL:-https://github.com/Jaksay/Linux-Router.git}"
 BRANCH="${LINUX_ROUTER_BRANCH:-main}"
 ARCHIVE_URL="${LINUX_ROUTER_ARCHIVE_URL:-}"
+LOCAL_ARCHIVE="${LINUX_ROUTER_ARCHIVE:-}"
 INSTALL_DIR="${LINUX_ROUTER_INSTALL_DIR:-/opt/linux-router}"
 DATA_DIR="${LINUX_ROUTER_DATA_DIR:-/var/lib/linux-router}"
 INSTALL_STATE_DIR="$DATA_DIR/.linux-router-installer"
@@ -394,6 +395,7 @@ Options:
   --repo URL                 GitHub repository URL
   --branch NAME              GitHub branch (default: main)
   --archive-url URL          Download a specific source archive instead
+  --archive PATH             Install/upgrade from a local tar.gz, no network access
   --install-dir PATH         Application directory (default: /opt/linux-router)
   --data-dir PATH            Persistent data directory (default: /var/lib/linux-router)
   --no-network-config        Do not write NetworkManager or netplan configuration
@@ -430,6 +432,11 @@ while [[ $# -gt 0 ]]; do
     --archive-url)
       [[ $# -ge 2 ]] || die "--archive-url requires a value"
       ARCHIVE_URL="$2"
+      shift 2
+      ;;
+    --archive)
+      [[ $# -ge 2 ]] || die "--archive requires a value"
+      LOCAL_ARCHIVE="$2"
       shift 2
       ;;
     --install-dir)
@@ -518,10 +525,14 @@ if [[ "$ACTION" == "uninstall" ]]; then
   exit 0
 fi
 
-if [[ -z "$ARCHIVE_URL" ]]; then
+if [[ -n "$LOCAL_ARCHIVE" ]]; then
+  [[ -n "$ARCHIVE_URL" ]] && die "--archive and --archive-url are mutually exclusive"
+  [[ -f "$LOCAL_ARCHIVE" ]] || die "archive file not found: $LOCAL_ARCHIVE"
+  [[ -r "$LOCAL_ARCHIVE" ]] || die "archive file is not readable: $LOCAL_ARCHIVE"
+elif [[ -z "$ARCHIVE_URL" ]]; then
   ARCHIVE_URL="${REPO_URL%.git}/archive/refs/heads/$BRANCH.tar.gz"
+  [[ "$ARCHIVE_URL" =~ ^https:// ]] || die "archive URL must use HTTPS"
 fi
-[[ "$ARCHIVE_URL" =~ ^https:// ]] || die "archive URL must use HTTPS"
 
 if [[ "$ACTION" == "install" ]]; then
   export DEBIAN_FRONTEND=noninteractive
@@ -547,30 +558,37 @@ else
   done
 fi
 
-log "Resolving $BRANCH branch build"
-REPO_PATH="${REPO_URL#https://github.com/}"
-REPO_PATH="${REPO_PATH%.git}"
-REF_JSON="$(curl --fail --location --silent --show-error --retry 3 \
-  "https://api.github.com/repos/$REPO_PATH/git/ref/heads/$BRANCH")" || \
-  die "could not resolve branch: $BRANCH"
-REMOTE_COMMIT="$(REF_JSON="$REF_JSON" python3 -c 'import json, os; print(json.loads(os.environ["REF_JSON"])["object"]["sha"])')" || \
-  die "could not parse branch metadata: $BRANCH"
-[[ -n "$REMOTE_COMMIT" ]] || die "could not resolve branch: $BRANCH"
-BUILD_ID="${REMOTE_COMMIT:0:7}"
-
-log "Downloading application archive"
 WORK_DIR="$(mktemp -d /tmp/linux-router-install.XXXXXX)"
 install -d -m 0755 "$WORK_DIR/source"
-curl --fail --location --silent --show-error --retry 3 \
-  --output "$WORK_DIR/source.tar.gz" "$ARCHIVE_URL"
-tar -xzf "$WORK_DIR/source.tar.gz" -C "$WORK_DIR/source" --strip-components=1
 
-[[ -f "$WORK_DIR/source/app.py" ]] || die "downloaded archive does not contain app.py"
-[[ -f "$WORK_DIR/source/router-panel.service" ]] || die "downloaded archive does not contain router-panel.service"
-[[ -f "$WORK_DIR/source/router-panel-agent.service" ]] || die "downloaded archive does not contain router-panel-agent.service"
-[[ -f "$WORK_DIR/source/agent.py" ]] || die "downloaded archive does not contain agent.py"
-[[ -d "$WORK_DIR/source/router_panel" ]] || die "downloaded archive does not contain router_panel"
-[[ -d "$WORK_DIR/source/templates" ]] || die "downloaded archive does not contain templates"
+if [[ -n "$LOCAL_ARCHIVE" ]]; then
+  BUILD_ID="local"
+  log "Extracting local application archive"
+  tar -xzf "$LOCAL_ARCHIVE" -C "$WORK_DIR/source" --strip-components=1
+else
+  log "Resolving $BRANCH branch build"
+  REPO_PATH="${REPO_URL#https://github.com/}"
+  REPO_PATH="${REPO_PATH%.git}"
+  REF_JSON="$(curl --fail --location --silent --show-error --retry 3 \
+    "https://api.github.com/repos/$REPO_PATH/git/ref/heads/$BRANCH")" || \
+    die "could not resolve branch: $BRANCH"
+  REMOTE_COMMIT="$(REF_JSON="$REF_JSON" python3 -c 'import json, os; print(json.loads(os.environ["REF_JSON"])["object"]["sha"])')" || \
+    die "could not parse branch metadata: $BRANCH"
+  [[ -n "$REMOTE_COMMIT" ]] || die "could not resolve branch: $BRANCH"
+  BUILD_ID="${REMOTE_COMMIT:0:7}"
+
+  log "Downloading application archive"
+  curl --fail --location --silent --show-error --retry 3 \
+    --output "$WORK_DIR/source.tar.gz" "$ARCHIVE_URL"
+  tar -xzf "$WORK_DIR/source.tar.gz" -C "$WORK_DIR/source" --strip-components=1
+fi
+
+[[ -f "$WORK_DIR/source/app.py" ]] || die "source archive does not contain app.py"
+[[ -f "$WORK_DIR/source/router-panel.service" ]] || die "source archive does not contain router-panel.service"
+[[ -f "$WORK_DIR/source/router-panel-agent.service" ]] || die "source archive does not contain router-panel-agent.service"
+[[ -f "$WORK_DIR/source/agent.py" ]] || die "source archive does not contain agent.py"
+[[ -d "$WORK_DIR/source/router_panel" ]] || die "source archive does not contain router_panel"
+[[ -d "$WORK_DIR/source/templates" ]] || die "source archive does not contain templates"
 python3 -m py_compile "$WORK_DIR/source/app.py" "$WORK_DIR/source/agent.py" "$WORK_DIR/source/router_panel/"*.py
 
 ROLLBACK_DIR="$WORK_DIR/rollback"

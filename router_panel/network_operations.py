@@ -412,7 +412,7 @@ def activate_hotspot_profile(
         "connection.autoconnect-priority", "100", "802-11-wireless.mode", "ap",
         "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password,
         "ipv4.method", "shared", "ipv4.addresses", lan_address,
-        "ipv4.link-local", "disabled", "ipv4.gateway", "", "ipv4.dns", "",
+        "ipv4.gateway", "", "ipv4.dns", "",
     ]
     if permanent_mac:
         modify_command.extend(
