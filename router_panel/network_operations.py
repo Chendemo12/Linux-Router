@@ -18,6 +18,7 @@ from .core import (
     get_hotspot_virtual_interface_name,
     get_network_interface_hardware,
     is_hotspot_virtual_interface,
+    is_service_active,
     load_network_config,
     normalize_mac_address,
     run_command,
@@ -692,6 +693,20 @@ def manage_networkmanager_interface(ifname: str) -> list[CommandResult]:
     return _manage_networkmanager_interface(ifname)
 
 
+def stop_external_hostapd() -> CommandResult | None:
+    """停用并禁用占用无线网卡的外部 hostapd/RaspAP 服务。
+
+    本项目通过 NetworkManager 建立热点，本身不会运行 hostapd，因此处于
+    active 的 hostapd 一定来自外部（如 RaspAP 或手动配置）。在把网卡交给
+    NetworkManager 接管前先将其 stop 并 disable，避免网卡被外部 AP 占用、
+    也避免停用后又被开机自启拉回。返回 None 表示服务未运行、无需处理。
+    """
+    if not is_service_active("hostapd"):
+        return None
+    run_command(["systemctl", "disable", "hostapd"], timeout=30)
+    return run_command(["systemctl", "stop", "hostapd"], timeout=30)
+
+
 def forget_wifi_profile(profile_uuid: str) -> CommandResult:
     return _forget_wifi_profile(profile_uuid)
 
@@ -727,6 +742,7 @@ __all__ = [
     "connect_wifi_profile",
     "disconnect_wifi",
     "manage_networkmanager_interface",
+    "stop_external_hostapd",
     "forget_wifi_profile",
     "start_hotspot_profile",
     "stop_hotspot_profile",

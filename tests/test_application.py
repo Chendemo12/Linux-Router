@@ -2299,6 +2299,74 @@ class ApplicationStructureTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(run.call_count, 2)
 
+    def test_stop_external_hostapd_disables_and_stops_when_active(self):
+        with (
+            patch.object(network_operations, "is_service_active", return_value=True),
+            patch.object(network_operations, "run_command", return_value=CommandResult(True, "")) as run,
+        ):
+            result = network_operations.stop_external_hostapd()
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.ok)
+        run.assert_any_call(["systemctl", "disable", "hostapd"], timeout=30)
+        run.assert_any_call(["systemctl", "stop", "hostapd"], timeout=30)
+
+    def test_stop_external_hostapd_noop_when_inactive(self):
+        with (
+            patch.object(network_operations, "is_service_active", return_value=False),
+            patch.object(network_operations, "run_command") as run,
+        ):
+            result = network_operations.stop_external_hostapd()
+
+        self.assertIsNone(result)
+        run.assert_not_called()
+
+    def test_interface_manage_stops_hostapd_before_takeover(self):
+        with (
+            patch.object(
+                agent_server,
+                "stop_external_hostapd",
+                return_value=CommandResult(True, ""),
+            ) as stop_hostapd,
+            patch.object(
+                agent_server,
+                "manage_networkmanager_interface",
+                return_value=[CommandResult(True, "")],
+            ) as manage,
+            patch.object(
+                agent_server,
+                "get_device_status_item",
+                return_value={"type": "wifi", "device": "wlan0"},
+            ),
+            patch.object(agent_server, "is_hotspot_virtual_interface", return_value=False),
+        ):
+            response = agent_server._execute_interface_manage({"ifname": "wlan0"})
+
+        stop_hostapd.assert_called_once_with()
+        manage.assert_called_once_with("wlan0")
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["message"], "已停用外部 hostapd 并将 wlan0 交给 NetworkManager 接管")
+
+    def test_interface_manage_skips_hostapd_message_when_none_running(self):
+        with (
+            patch.object(agent_server, "stop_external_hostapd", return_value=None),
+            patch.object(
+                agent_server,
+                "manage_networkmanager_interface",
+                return_value=[CommandResult(True, "")],
+            ),
+            patch.object(
+                agent_server,
+                "get_device_status_item",
+                return_value={"type": "wifi", "device": "wlan0"},
+            ),
+            patch.object(agent_server, "is_hotspot_virtual_interface", return_value=False),
+        ):
+            response = agent_server._execute_interface_manage({"ifname": "wlan0"})
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["message"], "已将 wlan0 交给 NetworkManager 接管")
+
     def test_hidden_bulk_dependency_action_is_rejected(self):
         result = dependencies.run_dependency_action("fix_all_dependencies")
         self.assertFalse(result.ok)

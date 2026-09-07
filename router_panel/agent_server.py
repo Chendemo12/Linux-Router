@@ -50,6 +50,7 @@ from .network_operations import (
     get_interface_permanent_mac,
     hotspot_keepalive_is_online,
     manage_networkmanager_interface,
+    stop_external_hostapd,
     recover_hotspot_keepalive,
     rescan_wifi,
     start_hotspot_profile,
@@ -409,10 +410,17 @@ def _execute_wifi_disconnect(params: dict[str, Any]) -> dict[str, Any]:
 
 def _execute_interface_manage(params: dict[str, Any]) -> dict[str, Any]:
     ifname = _require_wireless_interface(params)
+    # 接管前先停用外部 hostapd/RaspAP，真正把网卡从外部 AP 手里接管过来，
+    # 否则网卡虽由 NM 托管，但 hostapd 仍活跃会导致后续无法开启热点。
+    hostapd_result = stop_external_hostapd()
     results = manage_networkmanager_interface(ifname)
+    if hostapd_result is not None:
+        results.insert(0, hostapd_result)
     failed = next((item for item in results if not item.ok), None)
     if failed:
         return {"ok": False, "message": failed.output or f"{ifname} 接管失败"}
+    if hostapd_result is not None:
+        return {"ok": True, "message": f"已停用外部 hostapd 并将 {ifname} 交给 NetworkManager 接管"}
     return {"ok": True, "message": f"已将 {ifname} 交给 NetworkManager 接管"}
 
 
