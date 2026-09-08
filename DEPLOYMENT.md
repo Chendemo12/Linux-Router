@@ -239,6 +239,25 @@ $DATA_DIR/hotspot_keepalive.json
 
 热点首先使用 NetworkManager 默认安全参数激活；如果配置已写入但激活失败，会自动改用 WPA2-RSN、CCMP 并关闭 PMF 重试一次。第二次失败时会同时保留两次错误信息。
 
+### 热点后端选择：NetworkManager 或 hostapd
+
+热点可由两种后端驱动，通过 `network.json` 里的 `hotspot_backend` 字段（`nm` 或 `hostapd`，默认 `nm`）选择：
+
+```bash
+# 以 hostapd 后端为例
+sudo sed -i 's/"hotspot_backend": "nm"/"hotspot_backend": "hostapd"/' "$DATA_DIR/network.json"
+```
+
+- **`nm`（默认）**：NetworkManager 驱动射频进 AP 模式，DHCP/NAT 用 `ipv4.method=shared`。绝大多数网卡首选。
+- **`hostapd`**：由 `hostapd` 直接接管**物理无线口**起 AP，面板自管网关地址、独立 `dnsmasq` 与 `iptables` NAT。适用于 NetworkManager 的 `shared` AP 路径起不来的驱动（如部分 Realtek RTL8852BE）。
+
+要点：
+
+- 后端在 `router-panel-agent.service` 进程内**读取一次并缓存**，改字段后**必须重启 agent**（`sudo systemctl restart router-panel-agent.service`），并先停掉正在跑的热点再切。
+- hostapd 后端对网卡做独占接管（不开并发 AP+STA），`mode` 一律按独占处理。
+- 需要安装 `hostapd`（`install.sh` 已含）。
+- AP 自动保活对 hostapd 后端同样适用：探活走 hostapd/dnsmasq 运行时状态，掉线时自动重启后端。
+
 ```bash
 systemctl is-active NetworkManager.service
 command -v nmcli

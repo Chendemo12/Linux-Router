@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from .core import (
     CommandResult,
+    HOTSPOT_BACKEND_HOSTAPD,
     HOTSPOT_CONNECTION_NAME,
     NETWORKMANAGER_CONFIG_PATH,
     NETWORKMANAGER_CONF_DIR,
@@ -24,6 +25,7 @@ from .core import (
     run_command,
 )
 from .contracts import WifiConnectResult
+from .hotspot_backend import get_backend
 from .network import (
     get_active_wifi_connection,
     get_active_wired_connection,
@@ -265,6 +267,11 @@ def get_interface_permanent_mac(ifname: str) -> str:
 
 
 def configure_hotspot_keepalive(enabled: bool) -> CommandResult:
+    # Under the hostapd backend the AP is not a NetworkManager connection, so
+    # there is no autoconnect to tune; recovery is driven by the keepalive
+    # monitor re-running the backend. Nothing to configure here.
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        return CommandResult(True, "")
     return run_command(
         [
             "nmcli", "connection", "modify", "id", HOTSPOT_CONNECTION_NAME,
@@ -292,9 +299,13 @@ def resolve_hotspot_keepalive_parent(config: dict[str, object]) -> tuple[str, st
 
 
 def hotspot_keepalive_is_online(config: dict[str, object]) -> bool:
-    parent_ifname, _ = resolve_hotspot_keepalive_parent(config)
+    parent_ifname, phy_name = resolve_hotspot_keepalive_parent(config)
     if not parent_ifname:
         return False
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        # hostapd APs are not NM connections; an AP counts as online while the
+        # backend reports a live hostapd on this radio (see active_by_phy).
+        return bool(phy_name) and phy_name in get_backend().active_by_phy()
     active = get_hotspot_active_connection_for_parent(parent_ifname)
     hotspot_ifname = active.get("device", "")
     if not hotspot_ifname:
@@ -306,6 +317,24 @@ def recover_hotspot_keepalive(config: dict[str, object]) -> CommandResult:
     parent_ifname, phy_name = resolve_hotspot_keepalive_parent(config)
     if not parent_ifname:
         return CommandResult(False, "找不到保活热点对应的无线网卡")
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        # Hostapd has no NM connection to "up". Re-start the daemon from its
+        # surviving runtime config (RUN_ROOT/hostapd.conf survives a crash but
+        # not a stop). Read the profile first, tear down any stale instance,
+        # then bring the AP back up exactly as before.
+        profile = get_backend().profile()
+        if not profile.get("password"):
+            return CommandResult(False, "找不到可恢复的热点配置")
+        get_backend().stop(parent_ifname)
+        return get_backend().start(
+            parent_ifname,
+            phy_name,
+            profile.get("ssid", ""),
+            profile.get("password", ""),
+            profile.get("band", ""),
+            profile.get("channel", ""),
+            profile.get("mode", "exclusive"),
+        )
     profile = get_hotspot_profile()
     if not profile.get("password"):
         return CommandResult(False, "找不到可恢复的热点配置")

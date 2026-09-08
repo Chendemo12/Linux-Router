@@ -543,6 +543,7 @@ if [[ "$ACTION" == "install" ]]; then
     curl \
     dnsmasq-base \
     gunicorn \
+    hostapd \
     iproute2 \
     iptables \
     iw \

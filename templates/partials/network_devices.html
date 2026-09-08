@@ -13,7 +13,7 @@
             </div>
           </div>
           <div class="network-card-grid">
-            {% if device.state == 'unmanaged' %}
+            {% if device.state == 'unmanaged' and not device.active_hotspot %}
             <article class="network-item-card">
               <h4>NetworkManager</h4>
               <p class="muted compact">{{ device.wifi_scan_unavailable_reason }}</p>

@@ -2115,6 +2115,11 @@ class ApplicationStructureTests(unittest.TestCase):
                 "run_command",
                 side_effect=command_results,
             ) as run,
+            # activate_hotspot_profile calls disconnect_device before each
+            # activation attempt; that internally shells to run_command and would
+            # otherwise consume a slot in the side_effect above. These tests assert
+            # the delete/add/modify/up/compat sequence, so no-op the disconnect.
+            patch.object(network_operations, "disconnect_device"),
         ):
             result = network_operations.activate_hotspot_profile(
                 "wlan0",
@@ -2642,6 +2647,191 @@ class ApplicationStructureTests(unittest.TestCase):
             "/wired/connect",
         ):
             self.assertEqual(client.get(path).status_code, 404, path)
+
+
+class HotspotBackendDualModeTests(unittest.TestCase):
+    """Backend-aware hotspot dispatch (nm vs hostapd) and hostapd keepalive."""
+
+    def test_backend_config_normalization_and_default(self):
+        self.assertEqual(core.normalize_hotspot_backend("hostapd"), "hostapd")
+        self.assertEqual(core.normalize_hotspot_backend("nm"), "nm")
+        self.assertEqual(core.normalize_hotspot_backend(""), core.DEFAULT_HOTSPOT_BACKEND)
+        self.assertEqual(core.normalize_hotspot_backend("bogus"), core.DEFAULT_HOTSPOT_BACKEND)
+        self.assertEqual(core.DEFAULT_HOTSPOT_BACKEND, core.HOTSPOT_BACKEND_NETWORK_MANAGER)
+
+    def test_hostapd_backend_start_routes_to_backend_not_nm(self):
+        calls = {}
+
+        def fake_start(ifname, phy_name, ssid, password, band, channel, mode, progress=None):
+            calls["args"] = (ifname, phy_name, ssid, password, band, channel, mode)
+            return CommandResult(True, f"已开启热点：{ssid}")
+
+        backend = SimpleNamespace(name=lambda: core.HOTSPOT_BACKEND_HOSTAPD, start=fake_start)
+        with (
+            patch.object(agent_server, "get_backend", return_value=backend),
+            patch.object(agent_server, "start_hotspot_profile") as nm_start,
+        ):
+            result = agent_server._execute_hotspot_start(
+                {
+                    "ifname": "wlan0",
+                    "ssid": "Foo",
+                    "password": "secret123",
+                    "band": "bg",
+                    "channel": "6",
+                    "mode": "exclusive",
+                }
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls["args"], ("wlan0", "", "Foo", "secret123", "bg", "6", "exclusive"))
+        nm_start.assert_not_called()
+
+    def test_hostapd_backend_stop_routes_to_backend_not_nm(self):
+        backend = SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            stop=lambda ifname: CommandResult(True, "已关闭热点（hostapd）"),
+        )
+        with (
+            patch.object(agent_server, "get_backend", return_value=backend),
+            patch.object(
+                agent_server,
+                "get_device_status_item",
+                return_value={"device": "wlan0", "type": "wifi"},
+            ),
+            patch.object(agent_server, "stop_hotspot_profile") as nm_stop,
+        ):
+            result = agent_server._execute_hotspot_stop({"ifname": "wlan0"})
+        self.assertTrue(result["ok"])
+        nm_stop.assert_not_called()
+
+    def test_hostapd_keepalive_enable_requires_online_ap(self):
+        backend = SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            active_by_phy=lambda: {"phy0": {"device": "wlan0"}},
+        )
+        with (
+            patch.object(agent_server, "get_backend", return_value=backend),
+            patch.object(
+                agent_server,
+                "get_device_status_item",
+                return_value={"device": "wlan0", "type": "wifi"},
+            ),
+            patch.object(
+                agent_server,
+                "get_wireless_interface_phy_map",
+                return_value={"wlan0": "phy0"},
+            ),
+            patch.object(agent_server, "get_interface_permanent_mac", return_value="aa:bb:cc:dd:ee:ff"),
+            patch.object(
+                agent_server, "configure_hotspot_keepalive", return_value=CommandResult(True, "")
+            ) as configure,
+            patch.object(agent_server, "save_hotspot_keepalive") as save,
+        ):
+            result = agent_server._execute_hotspot_keepalive_enable({"ifname": "wlan0"})
+        self.assertTrue(result["ok"])
+        configure.assert_called_once_with(True)
+        save.assert_called_once()
+
+    def test_hostapd_keepalive_enable_offline_ap_refused(self):
+        backend = SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            active_by_phy=lambda: {},
+        )
+        with (
+            patch.object(agent_server, "get_backend", return_value=backend),
+            patch.object(
+                agent_server,
+                "get_device_status_item",
+                return_value={"device": "wlan0", "type": "wifi"},
+            ),
+            patch.object(
+                agent_server,
+                "get_wireless_interface_phy_map",
+                return_value={"wlan0": "phy0"},
+            ),
+            patch.object(agent_server, "get_interface_permanent_mac", return_value="aa:bb:cc:dd:ee:ff"),
+            patch.object(agent_server, "save_hotspot_keepalive") as save,
+        ):
+            with self.assertRaisesRegex(agent_server.ValidationError, "只能在线的 AP"):
+                agent_server._execute_hotspot_keepalive_enable({"ifname": "wlan0"})
+        save.assert_not_called()
+
+    def test_hostapd_keepalive_is_online_by_backend(self):
+        config = {"parent_ifname": "wlan0", "parent_mac": "aa:bb:cc:dd:ee:ff", "phy_name": "phy0"}
+        online = SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            active_by_phy=lambda: {"phy0": {"device": "wlan0"}},
+        )
+        offline = SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            active_by_phy=lambda: {},
+        )
+        with (
+            patch.object(network_operations, "get_backend", return_value=online),
+            patch.object(
+                network_operations,
+                "resolve_hotspot_keepalive_parent",
+                return_value=("wlan0", "phy0"),
+            ),
+        ):
+            self.assertTrue(network_operations.hotspot_keepalive_is_online(config))
+        with (
+            patch.object(network_operations, "get_backend", return_value=offline),
+            patch.object(
+                network_operations,
+                "resolve_hotspot_keepalive_parent",
+                return_value=("wlan0", "phy0"),
+            ),
+        ):
+            self.assertFalse(network_operations.hotspot_keepalive_is_online(config))
+
+    def test_hostapd_recover_restarts_backend(self):
+        calls = []
+
+        def fake_start(ifname, phy_name, ssid, password, band, channel, mode, progress=None):
+            calls.append((ifname, phy_name, ssid, password, band, channel, mode))
+            return CommandResult(True, f"已开启热点：{ssid}")
+
+        backend = SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            profile=lambda: {
+                "ssid": "Foo",
+                "password": "secret123",
+                "band": "bg",
+                "channel": "6",
+                "mode": "exclusive",
+            },
+            stop=lambda ifname: CommandResult(True, "stop"),
+            start=fake_start,
+        )
+        config = {"parent_ifname": "wlan0", "parent_mac": "aa:bb:cc:dd:ee:ff", "phy_name": "phy0"}
+        with (
+            patch.object(network_operations, "get_backend", return_value=backend),
+            patch.object(
+                network_operations,
+                "resolve_hotspot_keepalive_parent",
+                return_value=("wlan0", "phy0"),
+            ),
+        ):
+            result = network_operations.recover_hotspot_keepalive(config)
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, [("wlan0", "phy0", "Foo", "secret123", "bg", "6", "exclusive")])
+
+    def test_hostapd_recover_missing_profile_is_reported(self):
+        backend = SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            profile=lambda: {"ssid": "Foo", "password": "", "band": "", "channel": ""},
+        )
+        config = {"parent_ifname": "wlan0", "parent_mac": "aa:bb:cc:dd:ee:ff", "phy_name": "phy0"}
+        with (
+            patch.object(network_operations, "get_backend", return_value=backend),
+            patch.object(
+                network_operations,
+                "resolve_hotspot_keepalive_parent",
+                return_value=("wlan0", "phy0"),
+            ),
+        ):
+            result = network_operations.recover_hotspot_keepalive(config)
+        self.assertFalse(result.ok)
 
 
 if __name__ == "__main__":

@@ -656,6 +656,16 @@ def save_auth_config(config: dict[str, str]) -> None:
     )
 
 
+HOTSPOT_BACKEND_NETWORK_MANAGER = "nm"
+HOTSPOT_BACKEND_HOSTAPD = "hostapd"
+HOTSPOT_BACKEND_NAMES = (HOTSPOT_BACKEND_NETWORK_MANAGER, HOTSPOT_BACKEND_HOSTAPD)
+DEFAULT_HOTSPOT_BACKEND = HOTSPOT_BACKEND_NETWORK_MANAGER
+
+
+def normalize_hotspot_backend(value: str) -> str:
+    return value if value in HOTSPOT_BACKEND_NAMES else DEFAULT_HOTSPOT_BACKEND
+
+
 def normalize_lan_network(value: str) -> tuple[IPv4Network | None, str | None]:
     try:
         network = ip_network(value.strip(), strict=False)
@@ -687,18 +697,45 @@ def load_network_config() -> dict[str, str]:
     if network is None:
         network = IPv4Network(DEFAULT_LAN_NETWORK)
     gateway = next(network.hosts())
+    try:
+        raw = json.loads(NETWORK_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
     return {
         "lan_network": str(network),
         "lan_gateway": str(gateway),
         "lan_address": f"{gateway}/{network.prefixlen}",
+        "hotspot_backend": normalize_hotspot_backend(raw.get("hotspot_backend", "")),
     }
 
 
-def save_network_config(lan_network: IPv4Network) -> None:
+def save_network_config(lan_network: IPv4Network, hotspot_backend: str = "") -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        raw = json.loads(NETWORK_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    raw["lan_network"] = str(lan_network)
+    if hotspot_backend:
+        raw["hotspot_backend"] = normalize_hotspot_backend(hotspot_backend)
+    atomic_write_text(
+        NETWORK_CONFIG_PATH,
+        json.dumps(raw, ensure_ascii=False, indent=2),
+        mode=0o600,
+    )
+
+
+def save_hotspot_backend(mode: str) -> None:
+    normalized = normalize_hotspot_backend(mode)
+    try:
+        raw = json.loads(NETWORK_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    raw["hotspot_backend"] = normalized
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         NETWORK_CONFIG_PATH,
-        json.dumps({"lan_network": str(lan_network)}, ensure_ascii=False, indent=2),
+        json.dumps(raw, ensure_ascii=False, indent=2),
         mode=0o600,
     )
 
@@ -789,6 +826,12 @@ __all__ = [
     "normalize_lan_network",
     "load_network_config",
     "save_network_config",
+    "save_hotspot_backend",
+    "HOTSPOT_BACKEND_NETWORK_MANAGER",
+    "HOTSPOT_BACKEND_HOSTAPD",
+    "HOTSPOT_BACKEND_NAMES",
+    "DEFAULT_HOTSPOT_BACKEND",
+    "normalize_hotspot_backend",
     "get_build_info",
     "is_service_active",
     "is_service_enabled",

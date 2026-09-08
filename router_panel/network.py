@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
+    HOTSPOT_BACKEND_HOSTAPD,
     HOTSPOT_CONNECTION_NAME,
     HOTSPOT_DEFAULT_SSID,
     WIRELESS_PHY_CACHE_TTL,
@@ -15,11 +16,13 @@ from .core import (
     get_timed_cache,
     is_hotspot_virtual_interface,
     is_service_active,
+    load_network_config,
     normalize_mac_address,
     read_text,
     run_command,
     set_timed_cache,
 )
+from .hotspot_backend import get_backend
 from .contracts import HotspotClientsStatus, HotspotStatus, WiredProfile, WiredStatus, WirelessStatus
 from .hotspot_keepalive import get_hotspot_keepalive_runtime, load_hotspot_keepalive
 
@@ -197,7 +200,10 @@ def build_hotspot_frequency_settings(
             "description": "使用该无线接口开启热点；如正在连接 Wi-Fi，该连接会被关闭",
         }
     ]
-    if concurrency_info["mode"] in {"same_frequency", "cross_frequency"}:
+    # The hostapd backend drives the physical card exclusively and never offers
+    # concurrent AP+STA, so do not advertise it even if the driver claims support.
+    hostapd_exclusive = get_backend().name() == HOTSPOT_BACKEND_HOSTAPD
+    if not hostapd_exclusive and concurrency_info["mode"] in {"same_frequency", "cross_frequency"}:
         available_modes.append(
             {
                 "value": "concurrent",
@@ -407,6 +413,8 @@ def get_hotspot_device_settings(ifname: str) -> dict[str, Any]:
 
 
 def get_hotspot_profile() -> dict[str, str]:
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        return get_backend().profile()
     details = run_command(
         [
             "nmcli",
@@ -480,6 +488,9 @@ def get_hotspot_active_connections_by_phy(
     active_items: list[dict[str, str]],
     wireless_phy_map: dict[str, str],
 ) -> dict[str, dict[str, str]]:
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        # hostapd APs are not NetworkManager connections; report them from the backend.
+        return get_backend().active_by_phy()
     connections_by_phy: dict[str, dict[str, str]] = {}
     for connection in active_items:
         if connection.get("name") != HOTSPOT_CONNECTION_NAME:
@@ -838,6 +849,20 @@ def gather_wireless_network_status(
         wireless_devices = wireless_devices_future.result()
         active_items = active_items_future.result()
 
+    # Under the hostapd backend an active AP leaves its card unmanaged, which
+    # the network page would otherwise mistake for a card to hand back to NM
+    # (that "hand back" would tear the hotspot down). Mark such devices so the
+    # takeover affordance can be hidden.
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        active_hostapd_devices = {
+            info.get("device", "")
+            for info in get_backend().active_by_phy().values()
+        }
+        for wireless_device in wireless_devices:
+            wireless_device["active_hotspot"] = (
+                wireless_device.get("device", "") in active_hostapd_devices
+            )
+
     saved_wifi_networks = get_saved_wifi_networks(active_items)
     unbound_saved_networks = attach_saved_wifi_networks(wireless_devices, saved_wifi_networks)
 
@@ -909,7 +934,7 @@ def gather_hotspot_status() -> HotspotStatus:
         phy_capabilities_future = executor.submit(get_wireless_phy_capabilities)
         active_items_future = executor.submit(get_active_connections)
         hotspot_profile_future = executor.submit(get_hotspot_profile)
-        hotspot_conflict_future = executor.submit(is_service_active, "hostapd")
+        hotspot_conflict_future = executor.submit(lambda: get_backend().active_binding_conflict())
 
         hardware_items = hardware_future.result()
         wireless_phy_map = phy_map_future.result()
@@ -960,6 +985,10 @@ def gather_hotspot_status() -> HotspotStatus:
         if hotspot_active and hotspot_ifname:
             hotspot_detail = _get_cached_device_details(hotspot_device_details, hotspot_ifname)
             hotspot_ip = hotspot_detail["ipv4"][0] if hotspot_detail["ipv4"] else "无"
+            if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD and hotspot_ip == "无":
+                # hostapd owns the LAN side and assigns the gateway to the AP
+                # interface; the card is NM-unmanaged so nmcli reports no ipv4.
+                hotspot_ip = load_network_config()["lan_gateway"]
             if hotspot_ifname not in hotspot_radio_statuses:
                 hotspot_radio_statuses[hotspot_ifname] = get_hotspot_radio_status(
                     hotspot_ifname,
@@ -1093,6 +1122,8 @@ def get_interface_ipv4_neighbors(ifname: str) -> dict[str, str]:
 
 
 def get_hotspot_dhcp_leases(ifname: str) -> dict[str, dict[str, str]]:
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        return get_backend().dhcp_leases(ifname)
     lease_path = Path(f"/var/lib/NetworkManager/dnsmasq-{ifname}.leases")
     try:
         lines = lease_path.read_text(encoding="utf-8").splitlines()

@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from .core import (
     CommandResult,
+    HOTSPOT_BACKEND_HOSTAPD,
     HOTSPOT_CONNECTION_NAME,
     command_exists,
     get_network_interface_hardware,
@@ -27,6 +28,7 @@ from .core import (
     normalize_mac_address,
     request_system_reboot,
 )
+from .hotspot_backend import get_backend
 from .dependencies import gather_dependency_status, run_dependency_action
 from .network import (
     gather_hotspot_clients_status,
@@ -38,6 +40,7 @@ from .network import (
     get_hotspot_active_connection_for_parent,
     get_hotspot_profile,
     get_wifi_scan_unavailable_reason,
+    get_wireless_interface_phy_map,
     hotspot_band_label,
     select_hotspot_auto_channel,
 )
@@ -463,6 +466,38 @@ def _execute_wired_apply(params: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _execute_hotspot_start_hostapd(
+    ifname: str,
+    ssid: str,
+    password: str,
+    band: str,
+    channel: str,
+    mode: str,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Start the hotspot through the hostapd backend.
+
+    The hostapd backend drives the *physical* card exclusively (this driver
+    cannot host a virtual ``ap-*`` sub-interface in AP mode), so ``mode`` is
+    accepted but treated as exclusive regardless. The NetworkManager-specific
+    validations (frequency availability, hostapd-conflict refusal,
+    stale-profile cleanup) do not apply: this backend runs hostapd itself and
+    manages its own LAN side, so we hand the request straight to it.
+    """
+    backend = get_backend()
+    result = backend.start(
+        ifname,
+        "",
+        ssid,
+        password,
+        band,
+        channel,
+        mode,
+        progress=progress,
+    )
+    return _result(result, f"已开启热点：{ssid}", "开启热点失败")
+
+
 def _execute_hotspot_start(
     params: dict[str, Any],
     progress: ProgressCallback | None = None,
@@ -485,6 +520,11 @@ def _execute_hotspot_start(
         raise ValidationError("热点密码长度必须在 8 到 63 个字符之间")
     if channel and not _CHANNEL_RE.fullmatch(channel):
         raise ValidationError("热点信道无效")
+
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        return _execute_hotspot_start_hostapd(
+            ifname, ssid, password, band, channel, mode, progress
+        )
 
     device = get_hotspot_device_settings(ifname)
     if not device:
@@ -537,6 +577,8 @@ def _execute_hotspot_start(
 def _execute_hotspot_stop(params: dict[str, Any]) -> dict[str, Any]:
     ifname = _require_wireless_interface(params)
     _reject_protected_radio(ifname)
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        return _result(get_backend().stop(ifname), "已关闭热点", "关闭热点失败")
     return _result(stop_hotspot_profile(ifname), "已关闭热点", "关闭热点失败")
 
 
@@ -561,14 +603,23 @@ def _execute_hotspot_keepalive_enable(params: dict[str, Any]) -> dict[str, Any]:
         if _protected_radio_matches(ifname):
             return {"ok": True, "message": "该 AP 已处于保活状态"}
         raise ValidationError("已有 AP 设为保活，请先取消保活")
-    active = get_hotspot_active_connection_for_parent(ifname)
-    if active.get("name") != HOTSPOT_CONNECTION_NAME:
-        raise ValidationError("只能将当前在线的 AP 设为保活")
     parent_mac = get_interface_permanent_mac(ifname)
     if not parent_mac:
         raise ValidationError(f"无法读取 {ifname} 的永久 MAC 地址")
-    phy_name = get_hotspot_device_settings(ifname).get("phy_name", "")
-    configured = configure_hotspot_keepalive(True)
+    backend = get_backend()
+    if backend.name() == HOTSPOT_BACKEND_HOSTAPD:
+        # A hostapd AP is not an NM connection; treat it as "在线" when the
+        # backend reports a live AP on this radio. No NM autoconnect is tuned.
+        phy_name = get_wireless_interface_phy_map().get(ifname, "")
+        if not phy_name or phy_name not in backend.active_by_phy():
+            raise ValidationError("只能将当前在线的 AP 设为保活")
+        configured = configure_hotspot_keepalive(True)
+    else:
+        active = get_hotspot_active_connection_for_parent(ifname)
+        if active.get("name") != HOTSPOT_CONNECTION_NAME:
+            raise ValidationError("只能将当前在线的 AP 设为保活")
+        phy_name = get_hotspot_device_settings(ifname).get("phy_name", "")
+        configured = configure_hotspot_keepalive(True)
     if not configured.ok:
         return _result(configured, "已设为保活", "设置 AP 保活失败")
     try:
