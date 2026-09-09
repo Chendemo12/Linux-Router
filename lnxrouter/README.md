@@ -1,0 +1,1 @@
+lnxrouter --ap wlP2p33s0 SSID -p PASSWORD -o WLAN_DEV
