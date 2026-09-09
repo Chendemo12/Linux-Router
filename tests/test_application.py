@@ -2909,6 +2909,76 @@ class HostapdStatusSurfaceTests(unittest.TestCase):
         self.assertEqual(status["total_clients"], 1)
         self.assertEqual(status["hotspots"][0]["ssid"], "MI")
 
+    def test_hotspot_device_is_marked_hostapd_owned(self):
+        # In hostapd mode the takeover ("交给 NetworkManager 接管") affordance is
+        # meaningless (hostapd is what unmanages the card), so the hotspot page
+        # device must be flagged hostapd_owned to suppress that button.
+        backend = SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            active_by_phy=lambda: {"phy1": {"device": "wlan1"}},
+            active_binding_conflict=lambda: False,
+        )
+        capability = {
+            "supported_modes": ["AP"],
+            "bands": [
+                {
+                    "nmcli_band": "bg",
+                    "channels": [
+                        {
+                            "channel": "6",
+                            "disabled": False,
+                            "no_ir": False,
+                            "frequency_label": "2437 MHz",
+                        }
+                    ],
+                }
+            ],
+            "concurrency": {"ap_sta_mode": "unsupported"},
+        }
+        with (
+            patch.object(network, "get_backend", return_value=backend),
+            patch.object(
+                network,
+                "get_filtered_device_status",
+                return_value=(
+                    [{"device": "wlan1", "type": "wifi", "state": "unmanaged", "connection": ""}],
+                    [],
+                ),
+            ),
+            patch.object(
+                network,
+                "get_network_interface_hardware",
+                return_value=[{"name": "wlan1", "permanent_mac_address": "AA:BB:CC:DD:EE:11"}],
+            ),
+            patch.object(network, "get_wireless_interface_phy_map", return_value={"wlan1": "phy1"}),
+            patch.object(network, "get_wireless_phy_capabilities", return_value={"phy1": capability}),
+            patch.object(network, "get_active_connections", return_value=[]),
+            patch.object(
+                network,
+                "get_hotspot_profile",
+                return_value={
+                    "ssid": "MI",
+                    "password": "secret123",
+                    "band": "bg",
+                    "channel": "6",
+                    "interface_name": "wlan1",
+                    "mode": "exclusive",
+                },
+            ),
+            patch.object(network, "is_service_active", return_value=False),
+            patch.object(
+                network,
+                "get_device_details",
+                return_value={"ipv4": ["192.168.31.1/24"], "gateway": "", "dns": []},
+            ),
+            patch.object(network, "get_current_wifi_link", return_value={}),
+        ):
+            status = network.gather_hotspot_status()
+
+        device = status["wireless_devices"][0]
+        self.assertTrue(device["hostapd_owned"])
+        self.assertTrue(device["hotspot"]["active"])
+
     def test_clients_still_lists_nm_hotspot_stations(self):
         # The refactor must keep the NetworkManager backend path unchanged.
         nm_backend = SimpleNamespace(name=lambda: core.HOTSPOT_BACKEND_NETWORK_MANAGER)

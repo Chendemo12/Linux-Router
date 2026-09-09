@@ -12,7 +12,7 @@
               {% endif %}
             </div>
           </div>
-            {% if device.state == 'unmanaged' and not device.hotspot.active %}
+            {% if device.state == 'unmanaged' and not device.hotspot.active and not device.hostapd_owned %}
               <h4>NetworkManager</h4>
               <p class="muted compact">当前未交给 NetworkManager 管理，接管后才能开启热点</p>
               <div class="device-actions">

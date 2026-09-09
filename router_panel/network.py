@@ -862,16 +862,18 @@ def gather_wireless_network_status(
         wireless_devices = wireless_devices_future.result()
         active_items = active_items_future.result()
 
-    # Under the hostapd backend an active AP leaves its card unmanaged, which
-    # the network page would otherwise mistake for a card to hand back to NM
-    # (that "hand back" would tear the hotspot down). Mark such devices so the
-    # takeover affordance can be hidden.
+    # Under the hostapd backend the card is never something to hand back to NM:
+    # hostapd (ours) is what unmanages it, and the takeover action would tear
+    # down a running hostapd AP it does not actually stop. Mark every card so the
+    # "交给 NetworkManager 接管" affordance is suppressed on this page in
+    # hostapd mode (both while an AP runs and if one is left unmanaged).
     if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
         active_hostapd_devices = {
             info.get("device", "")
             for info in get_backend().active_by_phy().values()
         }
         for wireless_device in wireless_devices:
+            wireless_device["hostapd_owned"] = True
             wireless_device["active_hotspot"] = (
                 wireless_device.get("device", "") in active_hostapd_devices
             )
@@ -1026,6 +1028,9 @@ def gather_hotspot_status() -> HotspotStatus:
         )
         if keepalive_protected and hotspot_active and hotspot_ip != "无":
             keepalive_online = True
+        device["hostapd_owned"] = (
+            get_backend().name() == HOTSPOT_BACKEND_HOSTAPD
+        )
         device["hotspot"] = {
             "active": hotspot_active,
             "conflict": hotspot_conflict and not hotspot_active,
