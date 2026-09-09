@@ -20,10 +20,19 @@ from .core import (
     set_timed_cache,
 )
 from .contracts import SystemInfo
-from .network import get_active_connections
+from .network import get_active_connections, hostapd_active_any
 
 
 def summarize_network_status(active_connections: list[dict[str, str]]) -> dict[str, bool]:
+    # Under the hostapd backend the running AP is not an active NM connection
+    # (hostapd leaves the card NM-unmanaged), so it never appears in
+    # ``active_connections``. Ask the backend directly so the overview hotspot
+    # indicator reflects a live hostapd AP.
+    hotspot = any(
+        connection.get("type") == "802-11-wireless"
+        and connection.get("name") == HOTSPOT_CONNECTION_NAME
+        for connection in active_connections
+    ) or hostapd_active_any()
     return {
         "wired": any(
             connection.get("type") == "802-3-ethernet"
@@ -34,11 +43,7 @@ def summarize_network_status(active_connections: list[dict[str, str]]) -> dict[s
             and connection.get("name") != HOTSPOT_CONNECTION_NAME
             for connection in active_connections
         ),
-        "hotspot": any(
-            connection.get("type") == "802-11-wireless"
-            and connection.get("name") == HOTSPOT_CONNECTION_NAME
-            for connection in active_connections
-        ),
+        "hotspot": hotspot,
     }
 
 

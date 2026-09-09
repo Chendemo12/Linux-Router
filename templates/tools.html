@@ -1,4 +1,4 @@
-{% from "macros.html" import icon %}
+{% from "macros.html" import icon, tailscale_settings_fields %}
 {% extends "base.html" %}
 {% set title = "工具 - Linux Router" %}
 {% block content %}
@@ -44,6 +44,14 @@
         </dd>
       </div>
     </dl>
+    <form action="{{ url_for('tailscale_save') }}" method="post" class="login-form tailscale-settings-save-form" id="tailscale-settings-save-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <p class="muted">Tailnet 设置（保存后于下次连接生效）</p>
+      {{ tailscale_settings_fields(tailscale.config) }}
+      <div class="device-actions">
+        <button type="submit" class="button-info-strong">保存设置</button>
+      </div>
+    </form>
     <form action="{{ url_for('tailscale_logout') }}" method="post" class="inline-form tools-logout-form" id="tailscale-logout-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button type="submit" class="button-danger-outline">退出登录</button>
@@ -61,30 +69,9 @@
           {{ "tailscaled 正在运行" if tailscale.status.service_active else "登录时会尝试启动 tailscaled" }}
         </span>
       </div>
-      <label>
-        是否接受 Tailnet 路由
-        <span class="checkbox-row">
-          <input
-            type="checkbox"
-            name="accept_routes"
-            value="1"
-            {% if tailscale.config.accept_routes %}checked{% endif %}
-          >
-          <span>接受</span>
-        </span>
-      </label>
-      <label>
-        发布子网路由
-        <input
-          type="text"
-          name="advertise_routes"
-          value="{{ tailscale.config.advertise_routes }}"
-          placeholder="例如 192.168.50.0/24"
-          inputmode="text"
-        >
-        <span class="muted form-hint">多个网段用英文逗号分隔，留空则不发布路由</span>
-      </label>
+      {{ tailscale_settings_fields(tailscale.config) }}
       <div class="device-actions">
+        <button type="button" class="button-info" id="tailscale-save-in-login">保存设置</button>
         <button type="submit" class="button-info-strong">登录 Tailscale</button>
       </div>
     </form>
@@ -466,6 +453,42 @@
           "服务操作失败",
         );
       });
+    });
+
+    // Persist the Tailnet settings without triggering a login. The "保存设置"
+    // button inside the login form posts that form's fields to the save route.
+    const tailscaleSaveUrl = "{{ url_for('tailscale_save') }}";
+    const saveInLoginButton = document.getElementById("tailscale-save-in-login");
+    if (saveInLoginButton) {
+      const loginForm = document.getElementById("tailscale-login-form");
+      if (loginForm) {
+        saveInLoginButton.addEventListener("click", async () => {
+          const originalText = saveInLoginButton.textContent;
+          saveInLoginButton.disabled = true;
+          saveInLoginButton.textContent = "保存中...";
+          setToolsFeedback("");
+          try {
+            const data = await window.routerHttp.postForm(tailscaleSaveUrl, new FormData(loginForm));
+            setToolsFeedback(data.message || "Tailscale 设置已保存", data.ok ? "success" : "error", data.ok ? 2500 : 0);
+            window.setTimeout(() => window.location.reload(), data.ok ? 900 : 1600);
+          } catch {
+            setToolsFeedback("保存 Tailscale 设置失败", "error");
+            saveInLoginButton.disabled = false;
+            saveInLoginButton.textContent = originalText;
+          }
+        });
+      }
+    }
+
+    const tailscaleSettingsSaveForm = document.getElementById("tailscale-settings-save-form");
+    tailscaleSettingsSaveForm?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitToolsForm(
+        tailscaleSettingsSaveForm,
+        tailscaleSettingsSaveForm.querySelector('button[type="submit"]'),
+        "保存中...",
+        "保存 Tailscale 设置失败",
+      );
     });
   })();
 </script>

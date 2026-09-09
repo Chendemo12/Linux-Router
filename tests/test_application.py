@@ -61,6 +61,7 @@ EXPECTED_ROUTES = {
     "/tools/services/save",
     "/tools/tailscale/login",
     "/tools/tailscale/logout",
+    "/tools/tailscale/save",
     "/tools/tailscale/status",
     "/wifi",
     "/wifi/connect",
@@ -2832,6 +2833,150 @@ class HotspotBackendDualModeTests(unittest.TestCase):
         ):
             result = network_operations.recover_hotspot_keepalive(config)
         self.assertFalse(result.ok)
+
+
+class HostapdStatusSurfaceTests(unittest.TestCase):
+    """hostapd-backend awareness across the overview, deps and clients surfaces."""
+
+    def _hostapd_backend(self, active=True):
+        return SimpleNamespace(
+            name=lambda: core.HOTSPOT_BACKEND_HOSTAPD,
+            active_by_phy=lambda: {"phy0": {"device": "wlan0"}} if active else {},
+        )
+
+    def test_overview_summary_reports_hostapd_hotspot_online(self):
+        with patch.object(network, "get_backend", return_value=self._hostapd_backend(True)):
+            status = system.summarize_network_status([])
+        self.assertTrue(status["hotspot"])
+        self.assertFalse(status["wireless"])
+
+    def test_overview_summary_hostapd_inactive_shows_hotspot_off(self):
+        # hostapd selected but no AP up, and no NM hotspot connection either.
+        with patch.object(network, "get_backend", return_value=self._hostapd_backend(False)):
+            status = system.summarize_network_status([])
+        self.assertFalse(status["hotspot"])
+
+    def test_deps_hotspot_nat_ok_under_hostapd(self):
+        backend = self._hostapd_backend(True)
+        with (
+            patch.object(dependencies, "get_backend", return_value=backend),
+            patch.object(dependencies, "get_default_route_interface", return_value="eth0"),
+            patch.object(
+                dependencies,
+                "load_network_config",
+                return_value={"lan_network": "192.168.31.0/24", "lan_gateway": "192.168.31.1"},
+            ),
+            patch.object(dependencies, "read_text", return_value="1"),
+            patch.object(dependencies, "run_command", return_value=CommandResult(True, "")),
+        ):
+            status = dependencies.get_hotspot_nat_status()
+        self.assertEqual(status["level"], "ok")
+        self.assertIn("hostapd", status["summary"])
+
+    def test_deps_hotspot_nat_error_when_masquerade_missing(self):
+        with (
+            patch.object(dependencies, "get_backend", return_value=self._hostapd_backend(True)),
+            patch.object(dependencies, "get_default_route_interface", return_value="eth0"),
+            patch.object(
+                dependencies,
+                "load_network_config",
+                return_value={"lan_network": "192.168.31.0/24", "lan_gateway": "192.168.31.1"},
+            ),
+            patch.object(dependencies, "read_text", return_value="1"),
+            patch.object(dependencies, "run_command", return_value=CommandResult(False, "rule absent")),
+        ):
+            status = dependencies.get_hotspot_nat_status()
+        self.assertEqual(status["level"], "error")
+
+    def test_deps_hotspot_nat_warns_when_no_ap_running(self):
+        with patch.object(dependencies, "get_backend", return_value=self._hostapd_backend(False)):
+            status = dependencies.get_hotspot_nat_status()
+        self.assertEqual(status["level"], "warning")
+        self.assertIn("当前没有运行中的热点", status["summary"])
+
+    def test_clients_lists_hostapd_ap_stations(self):
+        with (
+            patch.object(network, "get_backend", return_value=self._hostapd_backend(True)),
+            patch.object(network, "get_hotspot_profile", return_value={"ssid": "MI"}),
+            patch.object(
+                network,
+                "get_hotspot_station_clients",
+                return_value=([{"mac_address": "aa:bb:cc:dd:ee:00", "signal": "-40"}], None),
+            ),
+        ):
+            status = network.gather_hotspot_clients_status()
+        self.assertEqual(len(status["hotspots"]), 1)
+        self.assertEqual(status["total_clients"], 1)
+        self.assertEqual(status["hotspots"][0]["ssid"], "MI")
+
+    def test_clients_still_lists_nm_hotspot_stations(self):
+        # The refactor must keep the NetworkManager backend path unchanged.
+        nm_backend = SimpleNamespace(name=lambda: core.HOTSPOT_BACKEND_NETWORK_MANAGER)
+        connection = {
+            "name": core.HOTSPOT_CONNECTION_NAME,
+            "type": "802-11-wireless",
+            "device": "wlan0",
+        }
+        with (
+            patch.object(network, "get_backend", return_value=nm_backend),
+            patch.object(network, "get_active_connections", return_value=[connection]),
+            patch.object(network, "get_hotspot_profile", return_value={"ssid": "MI"}),
+            patch.object(
+                network,
+                "get_hotspot_station_clients",
+                return_value=([{"mac_address": "aa:bb:cc:dd:ee:00", "signal": "-40"}], None),
+            ),
+        ):
+            status = network.gather_hotspot_clients_status()
+        self.assertEqual(len(status["hotspots"]), 1)
+        self.assertEqual(status["total_clients"], 1)
+
+
+class TailscaleSaveRouteTests(unittest.TestCase):
+    def _authed_client(self):
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        return client
+
+    def test_save_persists_unchecked_accept_routes(self):
+        client = self._authed_client()
+        with patch.object(web_tools, "save_tailscale_config") as save:
+            response = client.post(
+                "/tools/tailscale/save",
+                data={"csrf_token": "test-token"},
+                headers={"X-Requested-With": "fetch"},
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        save.assert_called_once_with({"accept_routes": False, "advertise_routes": ""})
+
+    def test_save_persists_checked_accept_routes(self):
+        client = self._authed_client()
+        with patch.object(web_tools, "save_tailscale_config") as save:
+            response = client.post(
+                "/tools/tailscale/save",
+                data={"csrf_token": "test-token", "accept_routes": "1", "advertise_routes": "10.0.0.0/8"},
+                headers={"X-Requested-With": "fetch"},
+            )
+        self.assertEqual(response.status_code, 200)
+        save.assert_called_once_with({"accept_routes": True, "advertise_routes": "10.0.0.0/8"})
+
+    def test_save_rejects_invalid_advertise_routes(self):
+        client = self._authed_client()
+        with patch.object(web_tools, "save_tailscale_config") as save:
+            response = client.post(
+                "/tools/tailscale/save",
+                data={"csrf_token": "test-token", "advertise_routes": "not-a-cidr"},
+                headers={"X-Requested-With": "fetch"},
+            )
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertFalse(payload["ok"])
+        save.assert_not_called()
 
 
 if __name__ == "__main__":

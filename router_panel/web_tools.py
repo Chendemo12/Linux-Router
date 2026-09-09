@@ -90,6 +90,29 @@ def register_tools_routes(app, login_required, is_async_request) -> None:
             return redirect(url_for("tools_page"))
         return queued_response(operation, "Tailscale 登录已加入队列")
 
+    @app.route("/tools/tailscale/save", methods=["POST"])
+    @login_required
+    def tailscale_save():
+        # Persist the Tailnet settings (accept_routes / advertise_routes)
+        # without triggering a login, so they survive independent of the login
+        # action and can be changed both before and after logging in.
+        config, error = normalize_tailscale_config(
+            {
+                "accept_routes": request.form.get("accept_routes", "") == "1",
+                "advertise_routes": request.form.get("advertise_routes", ""),
+            }
+        )
+        if error:
+            if is_async_request():
+                return {"ok": False, "pending": False, "message": error}, 400
+            flash(error, "error")
+            return redirect(url_for("tools_page"))
+        save_tailscale_config(config)
+        if is_async_request():
+            return {"ok": True, "pending": False, "message": "Tailscale 设置已保存"}
+        flash("Tailscale 设置已保存", "success")
+        return redirect(url_for("tools_page"))
+
     @app.route("/tools/tailscale/logout", methods=["POST"])
     @login_required
     def tailscale_logout():

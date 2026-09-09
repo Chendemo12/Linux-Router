@@ -511,6 +511,19 @@ def get_hotspot_active_connection_for_parent(ifname: str) -> dict[str, str]:
     return get_hotspot_active_connections_by_phy(active_items, get_wireless_interface_phy_map()).get(phy_name, {})
 
 
+def hostapd_active_any() -> bool:
+    """Return whether the hostapd backend currently runs an AP.
+
+    Cheap gate: returns False whenever the NetworkManager backend is active, so
+    callers that already hold the NM ``active_connections`` list can fall back to
+    the backend only for the hostapd case without triggering a second ``nmcli``
+    query.
+    """
+    if get_backend().name() != HOTSPOT_BACKEND_HOSTAPD:
+        return False
+    return bool(get_backend().active_by_phy())
+
+
 def get_device_status_item(ifname: str) -> dict[str, str]:
     if not ifname:
         return {}
@@ -1165,24 +1178,34 @@ def get_hotspot_station_clients(ifname: str) -> tuple[list[dict[str, Any]], str 
 
 def gather_hotspot_clients_status() -> HotspotClientsStatus:
     errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        active_items_future = executor.submit(get_active_connections)
-        hotspot_profile_future = executor.submit(get_hotspot_profile)
 
-        active_items = active_items_future.result()
-        hotspot_profile = hotspot_profile_future.result()
+    if get_backend().name() == HOTSPOT_BACKEND_HOSTAPD:
+        # hostapd APs are not NetworkManager connections; enumerate the ones the
+        # backend currently has up and report the stations associated with each.
+        hotspot_profile = get_hotspot_profile()
+        hotspot_ifnames = [
+            info.get("device", "").strip()
+            for info in get_backend().active_by_phy().values()
+            if info.get("device", "").strip()
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            active_items_future = executor.submit(get_active_connections)
+            hotspot_profile_future = executor.submit(get_hotspot_profile)
 
-    hotspot_connections = [
-        item
-        for item in active_items
-        if item.get("name") == HOTSPOT_CONNECTION_NAME
-        and item.get("type") == "802-11-wireless"
-        and item.get("device")
-    ]
+            active_items = active_items_future.result()
+            hotspot_profile = hotspot_profile_future.result()
+
+        hotspot_ifnames = [
+            item.get("device", "").strip()
+            for item in active_items
+            if item.get("name") == HOTSPOT_CONNECTION_NAME
+            and item.get("type") == "802-11-wireless"
+            and item.get("device")
+        ]
 
     hotspots: list[dict[str, Any]] = []
-    for connection in hotspot_connections:
-        hotspot_ifname = connection.get("device", "").strip()
+    for hotspot_ifname in hotspot_ifnames:
         clients, client_error = get_hotspot_station_clients(hotspot_ifname)
         if client_error:
             errors.append(client_error)
@@ -1603,6 +1626,7 @@ __all__ = [
     "get_active_connections",
     "get_hotspot_active_connections_by_phy",
     "get_hotspot_active_connection_for_parent",
+    "hostapd_active_any",
     "get_device_status_item",
     "get_filtered_device_status",
     "get_device_details",

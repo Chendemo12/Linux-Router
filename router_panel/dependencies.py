@@ -9,6 +9,7 @@ from typing import Any
 from .core import (
     APT_TIMEOUT,
     CommandResult,
+    HOTSPOT_BACKEND_HOSTAPD,
     HOTSPOT_CONNECTION_NAME,
     NETPLAN_DIR,
     NETWORKMANAGER_CONFIG_PATH,
@@ -21,11 +22,13 @@ from .core import (
     file_update_lock,
     is_service_active,
     is_service_enabled,
+    load_network_config,
     package_installed,
     python_module_available,
     read_text,
     run_command,
 )
+from .hotspot_backend import get_backend
 from .network import gather_wired_network_info, get_active_connections
 
 
@@ -142,7 +145,76 @@ def get_active_hotspot_connection() -> dict[str, str]:
     return {}
 
 
+# iptables NAT rules the hostapd backend inserts carry this comment tag; see
+# router_panel/adapters/hostapd_backend.py (_COMMENT_TAG / _NAT_RULES).
+_HOSTAPD_NAT_COMMENT = "router-panel-hostapd"
+
+
 def get_hotspot_nat_status() -> dict[str, str]:
+    backend = get_backend()
+    if backend.name() == HOTSPOT_BACKEND_HOSTAPD:
+        # hostapd APs are not NetworkManager connections, so there is no NM
+        # ``shared`` method to inspect. The backend owns NAT: it serves DHCP/DNS
+        # with a standalone dnsmasq and sets up iptables MASQUERADE + forwarding.
+        # Report OK when the backend has an AP up, IPv4 forwarding is on and the
+        # expected MASQUERADE rule for the LAN is present.
+        active = backend.active_by_phy()
+        hotspot_ifname = next(
+            (
+                info.get("device", "").strip()
+                for info in active.values()
+                if info.get("device", "").strip()
+            ),
+            "",
+        )
+        if not hotspot_ifname:
+            return {
+                "level": "warning",
+                "summary": "当前没有运行中的热点",
+                "details": "启动热点后才能检查共享规则",
+            }
+        uplink_ifname = get_default_route_interface().strip()
+        if not uplink_ifname or uplink_ifname == hotspot_ifname:
+            return {
+                "level": "warning",
+                "summary": "当前没有可用的上联网卡",
+                "details": "请先确保 STA 或有线网络已经联网",
+            }
+        lan_network = load_network_config()["lan_network"]
+        ip_forward = read_text("/proc/sys/net/ipv4/ip_forward").strip()
+        masquerade = run_command(
+            [
+                "iptables",
+                "-t",
+                "nat",
+                "-C",
+                "POSTROUTING",
+                "-s",
+                lan_network,
+                "!",
+                "-d",
+                lan_network,
+                "-j",
+                "MASQUERADE",
+                "-m",
+                "comment",
+                "--comment",
+                _HOSTAPD_NAT_COMMENT,
+            ],
+            timeout=8,
+        )
+        if ip_forward == "1" and masquerade.ok:
+            return {
+                "level": "ok",
+                "summary": "hostapd 热点共享已启用",
+                "details": f"{hotspot_ifname} -> {uplink_ifname}",
+            }
+        return {
+            "level": "error",
+            "summary": "hostapd 热点 NAT 未就绪",
+            "details": f"{hotspot_ifname} -> {uplink_ifname}",
+        }
+
     hotspot = get_active_hotspot_connection()
     hotspot_ifname = hotspot.get("device", "").strip()
     if not hotspot_ifname:

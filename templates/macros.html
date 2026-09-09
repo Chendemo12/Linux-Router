@@ -5,3 +5,29 @@
     aria-hidden="true"
   ></span>
 {%- endmacro %}
+
+{% macro tailscale_settings_fields(config) -%}
+  <label>
+    是否接受 Tailnet 路由
+    <span class="checkbox-row">
+      <input
+        type="checkbox"
+        name="accept_routes"
+        value="1"
+        {% if config.accept_routes %}checked{% endif %}
+      >
+      <span>接受</span>
+    </span>
+  </label>
+  <label>
+    发布子网路由
+    <input
+      type="text"
+      name="advertise_routes"
+      value="{{ config.advertise_routes }}"
+      placeholder="例如 192.168.50.0/24"
+      inputmode="text"
+    >
+    <span class="muted form-hint">多个网段用英文逗号分隔，留空则不发布路由</span>
+  </label>
+{%- endmacro %}
